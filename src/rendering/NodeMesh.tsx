@@ -1,0 +1,90 @@
+import { useRef, useMemo } from 'react'
+import { useFrame } from '@react-three/fiber'
+import { Html } from '@react-three/drei'
+import * as THREE from 'three'
+import type { NetworkNode } from '../types/network'
+import { NODE_COLORS } from '../config/topology'
+import { NODE_SIZE, NODE_GLOW } from '../config/constants'
+
+interface NodeMeshProps {
+  node: NetworkNode
+}
+
+// A glowing marker sitting on the globe surface, with a soft pulsing halo and a
+// label offset radially outward. The label fades out when the city rotates to
+// the far side of the globe, so it never shows through the planet.
+export function NodeMesh({ node }: NodeMeshProps) {
+  const haloRef = useRef<THREE.Mesh>(null)
+  const labelRef = useRef<HTMLDivElement>(null)
+
+  const color = NODE_COLORS[node.type]
+  const size = NODE_SIZE[node.type]
+  const glow = NODE_GLOW[node.type]
+  const opacity = node.active ? 1 : 0.2
+  const labelOpacity = node.active ? 0.95 : 0.45
+
+  // Surface-normal direction (node sits on a sphere centered at the origin).
+  const normal = useMemo<[number, number, number]>(() => {
+    const [x, y, z] = node.position
+    const len = Math.hypot(x, y, z) || 1
+    return [x / len, y / len, z / len]
+  }, [node.position])
+
+  const labelPos = useMemo<[number, number, number]>(() => {
+    const off = size + 0.35
+    return [normal[0] * off, normal[1] * off, normal[2] * off]
+  }, [normal, size])
+
+  const phase = useMemo(() => Math.random() * Math.PI * 2, [])
+
+  useFrame(({ clock, camera }) => {
+    if (haloRef.current) {
+      const t = clock.getElapsedTime()
+      haloRef.current.scale.setScalar(1 + Math.sin(t * 2 + phase) * 0.18)
+    }
+    // Fade the label when the city is on the hemisphere facing away from camera.
+    if (labelRef.current) {
+      const cp = camera.position
+      const cl = Math.hypot(cp.x, cp.y, cp.z) || 1
+      const facing = (normal[0] * cp.x + normal[1] * cp.y + normal[2] * cp.z) / cl
+      labelRef.current.style.opacity = String(facing > 0.05 ? labelOpacity : 0)
+    }
+  })
+
+  return (
+    <group position={node.position}>
+      {/* Soft halo */}
+      <mesh ref={haloRef}>
+        <sphereGeometry args={[size * 2, 16, 16]} />
+        <meshBasicMaterial color={color} transparent opacity={0.18 * opacity} depthWrite={false} />
+      </mesh>
+
+      {/* Marker core */}
+      <mesh>
+        <sphereGeometry args={[size, 20, 20]} />
+        <meshStandardMaterial
+          color={color}
+          emissive={color}
+          emissiveIntensity={glow * opacity}
+          roughness={0.3}
+          metalness={0.4}
+          toneMapped={false}
+        />
+      </mesh>
+
+      {/* Label */}
+      <Html position={labelPos} center distanceFactor={22} zIndexRange={[10, 0]}>
+        <div
+          ref={labelRef}
+          style={{ pointerEvents: 'none', opacity: labelOpacity }}
+          className="px-1.5 py-0.5 rounded text-center whitespace-nowrap text-slate-100 bg-slate-950/65 border border-white/10"
+        >
+          <div className="text-[11px] font-medium tracking-wide leading-tight">{node.label}</div>
+          {node.subLabel && (
+            <div className="text-[9px] text-slate-400 leading-tight">{node.subLabel}</div>
+          )}
+        </div>
+      </Html>
+    </group>
+  )
+}
