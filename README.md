@@ -109,9 +109,16 @@ src/
     constants.ts          # tuning (spawn rate, sizes, camera)
   App.tsx                 # canvas + keyboard handling
   main.tsx
+public/
+  earth-day.jpg           # NASA "blue marble" land/ocean texture
+  earth-night.jpg         # night-lights map (emissive city glow)
+  earth-bump.png          # topology / terrain bump map
 scripts/
   engine-test.mts         # headless engine verification
 ```
+
+The Earth uses NASA imagery (via the [three-globe](https://github.com/vasturiano/three-globe)
+example assets) served locally from `public/`, so it works offline.
 
 ## Verifying the engine
 
@@ -134,5 +141,5 @@ complete, that raising the firewall drops packets, and that reset clears state.
 | Real DDoS attacker node  | `simulation.ts` `toggleDDoS()` — target one server/link |
 | New cities / nodes       | add entries to `NODE_DEFS` in `topology.ts` (lat/long)  |
 | New node tiers           | `types/network.ts` → `topology.ts` (colors) → `NodeMesh.tsx` |
-| Real Earth texture       | `Globe.tsx` — swap the ocean material for a world map texture |
+| Day/night terminator     | `Globe.tsx` — custom shader to mask night lights by sun angle |
 | Per-link load coloring   | `LinkMesh.tsx` — tint by packets currently on the link  |
