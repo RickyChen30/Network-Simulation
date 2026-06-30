@@ -39,9 +39,11 @@ export function Dashboard({ stats }: DashboardProps) {
       </div>
 
       <div>
-        <StatRow label="Active Packets" value={stats.activePackets} color="text-cyan-300" />
-        <StatRow label="Round-trips" value={stats.deliveredPackets} color="text-emerald-400" />
+        <StatRow label="Connections" value={stats.connections} color="text-cyan-300" />
+        <StatRow label="In Flight" value={stats.activePackets} color="text-sky-300" />
+        <StatRow label="Completed" value={stats.completed} color="text-emerald-400" />
         <StatRow label="Dropped" value={stats.droppedPackets} color="text-rose-400" />
+        <StatRow label="Retransmits" value={stats.retransmits} color="text-orange-300" />
         <StatRow label="Avg RTT" value={`${stats.averageLatency} ms`} color="text-amber-300" />
         <StatRow
           label="Routing"
@@ -49,6 +51,27 @@ export function Dashboard({ stats }: DashboardProps) {
           color="text-purple-300"
         />
       </div>
+
+      {/* Live protocol mix */}
+      <div className="mt-3 pt-3 border-t border-white/5">
+        <p className="text-[10px] text-slate-500 uppercase tracking-[0.2em] mb-2">Protocols in flight</p>
+        <div className="flex gap-1.5">
+          <ProtoChip label="TCP" value={stats.protocolMix.TCP} color="#38bdf8" />
+          <ProtoChip label="UDP" value={stats.protocolMix.UDP} color="#c084fc" />
+          <ProtoChip label="ICMP" value={stats.protocolMix.ICMP} color="#34d399" />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ProtoChip({ label, value, color }: { label: string; value: number; color: string }) {
+  return (
+    <div className="flex-1 rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-center">
+      <div className="text-[10px] font-semibold tracking-wide" style={{ color }}>
+        {label}
+      </div>
+      <div className="text-sm font-mono font-semibold text-white">{value}</div>
     </div>
   )
 }

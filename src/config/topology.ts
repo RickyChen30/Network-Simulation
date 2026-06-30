@@ -64,11 +64,32 @@ const NODE_DEFS: NodeDef[] = [
   { id: 'srv-tyo1', type: 'server', lat: 35.55, long: 139.9, label: 'ap-ne-web' },
 ]
 
-export const INITIAL_NODES: NetworkNode[] = NODE_DEFS.map(d => ({
+// Assign a plausible public IP per node, with a different first octet per tier
+// so the addresses look realistic and inspectable.
+const IP_BLOCK: Record<NodeType, number> = {
+  home: 24,
+  'home-router': 192,
+  'isp-router': 100,
+  'core-router': 80,
+  gateway: 62,
+  datacenter: 104,
+  server: 151,
+}
+
+function ipFor(type: NodeType, i: number): string {
+  const a = IP_BLOCK[type] ?? 10
+  const b = ((i * 37 + 11) % 254) + 1
+  const c = ((i * 53 + 7) % 254) + 1
+  const d = ((i * 97 + 3) % 254) + 1
+  return `${a}.${b}.${c}.${d}`
+}
+
+export const INITIAL_NODES: NetworkNode[] = NODE_DEFS.map((d, i) => ({
   id: d.id,
   type: d.type,
   label: d.label,
   subLabel: d.sub,
+  ip: ipFor(d.type, i),
   position: latLongToVec3(d.lat, d.long),
   active: true,
 }))
@@ -153,8 +174,9 @@ export const NODE_TIER_LABELS: Record<NodeType, string> = {
   gateway: 'Cable Landing',
 }
 
-// Packet colors by kind.
-export const PACKET_COLORS: Record<string, string> = {
-  request: '#67e8f9',  // bright cyan — heading to the server
-  response: '#fde047', // warm yellow — data coming back home
+// Packet colors by transport protocol.
+export const PROTOCOL_COLORS: Record<'TCP' | 'UDP' | 'ICMP', string> = {
+  TCP: '#38bdf8',  // blue — reliable, connection-oriented
+  UDP: '#c084fc',  // purple — connectionless datagrams
+  ICMP: '#34d399', // green — echo / ping
 }

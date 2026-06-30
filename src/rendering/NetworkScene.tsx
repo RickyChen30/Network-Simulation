@@ -154,9 +154,13 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
         <LinkMesh key={link.id} link={link} nodes={nodes} />
       ))}
 
-      {nodes.map(node => (
-        <NodeMesh key={node.id} node={node} showLabel={!focusedId} onFocus={onFocus} />
-      ))}
+      {/* City markers — the focused city's marker is hidden, since its detailed
+          cityscape + local-network hub stand in for it. */}
+      {nodes
+        .filter(node => node.id !== focusedId)
+        .map(node => (
+          <NodeMesh key={node.id} node={node} showLabel={!focusedId} onFocus={onFocus} />
+        ))}
 
       {packets.map(packet => (
         <PacketMesh key={packet.id} packet={packet} positionCache={positionCache} />

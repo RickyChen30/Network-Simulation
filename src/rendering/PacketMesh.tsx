@@ -23,21 +23,25 @@ export function PacketMesh({ packet, positionCache }: PacketMeshProps) {
     meshRef.current.position.set(...pos)
   })
 
-  const fading = packet.status === 'delivered' ? 0.25 : 1
+  // Dropped packets flash red and fade; control segments are smaller than data.
+  const dropped = packet.status === 'dropped'
+  const fading = packet.status === 'delivered' ? 0.3 : 1
+  const color = dropped ? '#ef4444' : packet.color
+  const radius = PACKET_RADIUS * (packet.control ? 0.7 : 1.1)
 
   return (
     <Trail
-      width={packet.kind === 'response' ? 2.0 : 1.7}
+      width={packet.control ? 1.4 : 2.2}
       length={5}
-      color={new THREE.Color(packet.color)}
+      color={new THREE.Color(color)}
       attenuation={w => w * w}
       decay={1.2}
     >
       <mesh ref={meshRef}>
-        <sphereGeometry args={[PACKET_RADIUS, 14, 14]} />
+        <sphereGeometry args={[radius, 14, 14]} />
         <meshStandardMaterial
-          color={packet.color}
-          emissive={packet.color}
+          color={color}
+          emissive={color}
           emissiveIntensity={2.2 * fading}
           roughness={0.1}
           metalness={0.3}

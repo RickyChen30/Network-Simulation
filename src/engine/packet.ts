@@ -1,5 +1,5 @@
-import type { Packet, PacketKind, NetworkLink } from '../types/network'
-import { PACKET_COLORS } from '../config/topology'
+import type { Packet, Protocol, Segment, NetworkLink } from '../types/network'
+import { PROTOCOL_COLORS } from '../config/topology'
 import { arcPoint } from '../config/globe'
 import {
   SEGMENT_BASE_SECONDS,
@@ -40,28 +40,43 @@ function computeSegmentDurations(path: string[], links: NetworkLink[]): number[]
   return durations
 }
 
-export function createPacket(
-  kind: PacketKind,
-  sourceId: string,
-  destinationId: string,
-  path: string[],
-  links: NetworkLink[],
-  simulationTimeMs: number,
-): Packet {
+// Control segments (handshake / ack / teardown) carry no payload.
+const CONTROL_SEGMENTS = new Set<Segment>([
+  'SYN', 'SYN-ACK', 'ACK', 'DATA-ACK', 'FIN', 'FIN-ACK',
+])
+
+export interface CreatePacketArgs {
+  flowId: string
+  protocol: Protocol
+  segment: Segment
+  sourceId: string
+  destinationId: string
+  path: string[]
+  links: NetworkLink[]
+  simulationTimeMs: number
+  lossAt?: number | null
+}
+
+export function createPacket(args: CreatePacketArgs): Packet {
   _packetCounter++
+  const control = CONTROL_SEGMENTS.has(args.segment)
 
   return {
     id: `pkt-${_packetCounter}`,
-    kind,
-    sourceId,
-    destinationId,
-    path,
-    segmentDurations: computeSegmentDurations(path, links),
+    flowId: args.flowId,
+    protocol: args.protocol,
+    segment: args.segment,
+    control,
+    sourceId: args.sourceId,
+    destinationId: args.destinationId,
+    path: args.path,
+    segmentDurations: computeSegmentDurations(args.path, args.links),
     pathIndex: 0,
     progress: 0,
-    createdAt: simulationTimeMs,
+    createdAt: args.simulationTimeMs,
     status: 'in-flight',
-    color: PACKET_COLORS[kind],
+    lossAt: args.lossAt ?? null,
+    color: PROTOCOL_COLORS[args.protocol],
   }
 }
 
@@ -70,14 +85,25 @@ export function resetPacketCounter(): void {
 }
 
 // Advance a packet along its path by deltaSeconds of real time.
-// Returns true the moment it reaches its destination node.
-export function stepPacket(packet: Packet, deltaSeconds: number): boolean {
-  if (packet.status !== 'in-flight') return false
+// Returns 'delivered' when it reaches the destination, 'dropped' if it is lost
+// in transit, or null while still in flight.
+export function stepPacket(packet: Packet, deltaSeconds: number): 'delivered' | 'dropped' | null {
+  if (packet.status !== 'in-flight') return null
 
+  // Overall progress along the whole path (for the loss check).
+  const segCount = Math.max(1, packet.path.length - 1)
   const duration = packet.segmentDurations[packet.pathIndex] ?? 0.3
   packet.progress += deltaSeconds / duration
 
-  // Handle crossing one or more node boundaries in a single tick
+  // Lost packet: vanish once it passes its loss point.
+  if (packet.lossAt !== null) {
+    const overall = (packet.pathIndex + Math.min(packet.progress, 1)) / segCount
+    if (overall >= packet.lossAt) {
+      packet.status = 'dropped'
+      return 'dropped'
+    }
+  }
+
   while (packet.progress >= 1) {
     packet.pathIndex++
     packet.progress -= 1
@@ -85,11 +111,11 @@ export function stepPacket(packet: Packet, deltaSeconds: number): boolean {
     if (packet.pathIndex >= packet.path.length - 1) {
       packet.status = 'delivered'
       packet.progress = 0
-      return true
+      return 'delivered'
     }
   }
 
-  return false
+  return null
 }
 
 // World-space position of a packet on its current link. Follows the same

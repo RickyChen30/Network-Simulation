@@ -10,9 +10,12 @@ import { CAMERA_POSITION } from './config/constants'
 
 const DEFAULT_STATS: SimulationStats = {
   activePackets: 0,
-  deliveredPackets: 0,
+  connections: 0,
+  completed: 0,
   droppedPackets: 0,
+  retransmits: 0,
   averageLatency: 0,
+  protocolMix: { TCP: 0, UDP: 0, ICMP: 0 },
   routingMode: 'shortest-path',
   isPaused: false,
 }
@@ -99,9 +102,10 @@ export default function App() {
         <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-slate-950/75 backdrop-blur-md border border-white/10 rounded-xl px-4 py-2.5 shadow-2xl">
           <div className="text-center">
             <div className="text-sm font-semibold text-white tracking-wide">{focusedNode.label}</div>
-            {focusedNode.subLabel && (
-              <div className="text-[11px] text-teal-300/80">{focusedNode.subLabel}</div>
-            )}
+            <div className="text-[11px] text-teal-300/80 font-mono">
+              {focusedNode.ip}
+              {focusedNode.subLabel ? ` · ${focusedNode.subLabel}` : ''}
+            </div>
           </div>
           <button
             onClick={() => setFocusedId(null)}

@@ -16,10 +16,25 @@ export type NodeType =
 
 export type RoutingMode = 'shortest-path' | 'adaptive' | 'ddos'
 
-// Packets come in two flavors so traffic looks bidirectional and realistic:
-//   request  — a home asking a server for data
-//   response — the server's reply traveling back to the home
-export type PacketKind = 'request' | 'response'
+// Transport protocols modeled by the simulation.
+export type Protocol = 'TCP' | 'UDP' | 'ICMP'
+
+// A packet belongs to a flow and carries one protocol segment. The segment is
+// what makes a transmission look real: TCP does a SYN/SYN-ACK/ACK handshake,
+// streams DATA that gets ACKed, then tears down with FIN/FIN-ACK; UDP just fires
+// datagrams; ICMP is an echo/reply ping.
+export type Segment =
+  | 'SYN'
+  | 'SYN-ACK'
+  | 'ACK'
+  | 'DATA'
+  | 'DATA-ACK'
+  | 'FIN'
+  | 'FIN-ACK'
+  | 'RETX' // a TCP retransmission after a lost segment
+  | 'DATAGRAM' // UDP
+  | 'ECHO' // ICMP request
+  | 'REPLY' // ICMP reply
 
 export type PacketStatus = 'in-flight' | 'delivered' | 'dropped'
 
@@ -27,8 +42,10 @@ export interface NetworkNode {
   id: string
   type: NodeType
   label: string
-  // Optional secondary label (e.g. the Chinese city / operator name)
+  // Optional secondary label (e.g. the operator / region name)
   subLabel?: string
+  // Assigned IP address (for a realistic, inspectable network)
+  ip: string
   // 3D position in world space (X = east, Z = south, Y = up)
   position: [number, number, number]
   // Whether this node is currently forwarding traffic (firewall toggle flips datacenters)
@@ -45,16 +62,18 @@ export interface NetworkLink {
   bandwidth: number
 }
 
-// A packet travels along a pre-computed path from source to destination.
+// A packet is one segment of a flow, traveling a pre-computed path.
 export interface Packet {
   id: string
-  kind: PacketKind
+  flowId: string
+  protocol: Protocol
+  segment: Segment
+  control: boolean // true for handshake/ack/teardown (vs payload data)
   sourceId: string
   destinationId: string
   // Ordered list of node IDs the packet will traverse
   path: string[]
-  // How long (real seconds) each path segment takes — derived from link latency,
-  // so backbone hops are fast and last-mile home hops are slow.
+  // How long (real seconds) each path segment takes — derived from link latency.
   segmentDurations: number[]
   // Index into path indicating which link we're currently on
   pathIndex: number
@@ -62,15 +81,21 @@ export interface Packet {
   progress: number
   createdAt: number // simulation time in ms
   status: PacketStatus
+  // If set (0..1), the packet is "lost" and vanishes when progress passes this.
+  lossAt: number | null
   color: string
 }
 
 export interface SimulationStats {
   activePackets: number
-  deliveredPackets: number   // completed round-trips (response reached home)
-  droppedPackets: number     // requests with no available route (e.g. firewall down)
-  // Rolling average round-trip time over recently completed exchanges
+  connections: number      // open flows (TCP connections / UDP+ICMP exchanges)
+  completed: number        // flows that finished successfully
+  droppedPackets: number   // packets lost in transit (or with no route)
+  retransmits: number      // TCP segments resent after loss
+  // Rolling average round-trip time (ms), measured SYN → SYN-ACK etc.
   averageLatency: number
+  // Live packet count per protocol
+  protocolMix: Record<Protocol, number>
   routingMode: RoutingMode
   isPaused: boolean
 }

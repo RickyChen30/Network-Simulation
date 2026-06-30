@@ -1,141 +1,290 @@
-import type { Packet, SimulationStats, RoutingMode } from '../types/network'
+import type { Packet, SimulationStats, RoutingMode, Protocol, Segment } from '../types/network'
 import { NetworkGraph } from './network'
 import { findShortestPath, computePathLatency } from './routing'
 import { createPacket, resetPacketCounter, stepPacket } from './packet'
-import {
-  PACKET_SPAWN_RATE,
-  MAX_ACTIVE_PACKETS,
-  PACKET_LINGER_MS,
-  LATENCY_WINDOW,
-} from '../config/constants'
+import { MAX_ACTIVE_PACKETS, PACKET_LINGER_MS, LATENCY_WINDOW } from '../config/constants'
 
-// SimulationEngine drives the whole model. It is pure TypeScript with no React
-// dependency, so it can be unit-tested in isolation. The renderer ticks it once
-// per frame and reads its public state.
+// --- Flow model ------------------------------------------------------------
+// A "flow" is one logical transmission (a TCP connection, a UDP exchange, or an
+// ICMP ping). It owns an ordered list of steps; each step emits one packet. TCP
+// and ICMP steps are stop-and-wait (the next step waits for the previous packet
+// to arrive), so the handshake plays out in order; UDP datagrams just stream.
+
+interface FlowStep {
+  segment: Segment
+  dir: 'fwd' | 'ret'
+  wait: boolean
+}
+
+interface Flow {
+  id: string
+  protocol: Protocol
+  srcId: string
+  dstId: string
+  fwdPath: string[]
+  revPath: string[]
+  srcPort: number
+  dstPort: number
+  steps: FlowStep[]
+  stepIndex: number
+  awaiting: boolean
+  awaitingPacketId: string | null
+  awaitingStep: FlowStep | null
+  awaitingSince: number
+  retxCount: number
+  rttRecorded: boolean
+  lastEmit: number
+  done: boolean
+}
+
+const FLOW_SPAWN_RATE = 1.3 // new flows per real second
+const MAX_FLOWS = 26
+const LOSS_PROB = 0.06 // chance any packet is lost in transit
+const TCP_TIMEOUT_MS = 1100 // retransmit timeout for an un-acked TCP segment
+const UDP_STAGGER_MS = 110 // gap between UDP datagrams
+const MAX_RETX = 4
+
+let _flowCounter = 0
+
+function pickProtocol(ddos: boolean): Protocol {
+  if (ddos) return 'TCP' // DDoS = SYN flood
+  const r = Math.random()
+  if (r < 0.6) return 'TCP'
+  if (r < 0.9) return 'UDP'
+  return 'ICMP'
+}
+
+function destPort(protocol: Protocol): number {
+  if (protocol === 'TCP') return Math.random() < 0.5 ? 443 : 80
+  if (protocol === 'UDP') return Math.random() < 0.5 ? 53 : 443
+  return 0
+}
+
+function buildSteps(protocol: Protocol): FlowStep[] {
+  if (protocol === 'TCP') {
+    const steps: FlowStep[] = [
+      { segment: 'SYN', dir: 'fwd', wait: true },
+      { segment: 'SYN-ACK', dir: 'ret', wait: true },
+      { segment: 'ACK', dir: 'fwd', wait: true },
+    ]
+    const dataCount = 2 + Math.floor(Math.random() * 4)
+    for (let i = 0; i < dataCount; i++) {
+      steps.push({ segment: 'DATA', dir: 'fwd', wait: true })
+      steps.push({ segment: 'DATA-ACK', dir: 'ret', wait: true })
+    }
+    steps.push({ segment: 'FIN', dir: 'fwd', wait: true })
+    steps.push({ segment: 'FIN-ACK', dir: 'ret', wait: true })
+    return steps
+  }
+  if (protocol === 'UDP') {
+    const n = 3 + Math.floor(Math.random() * 6)
+    return Array.from({ length: n }, () => ({ segment: 'DATAGRAM' as Segment, dir: 'fwd' as const, wait: false }))
+  }
+  // ICMP echo / reply, a few rounds
+  const rounds = 1 + Math.floor(Math.random() * 3)
+  const steps: FlowStep[] = []
+  for (let i = 0; i < rounds; i++) {
+    steps.push({ segment: 'ECHO', dir: 'fwd', wait: true })
+    steps.push({ segment: 'REPLY', dir: 'ret', wait: true })
+  }
+  return steps
+}
+
 export class SimulationEngine {
   graph: NetworkGraph
   packets: Packet[]
 
+  private _flows: Flow[]
   private _isPaused: boolean
   private _routingMode: RoutingMode
   private _isDDoS: boolean
 
-  private _deliveredPackets: number   // completed round-trips
-  private _droppedPackets: number
-  private _recentRtts: number[]       // sliding window of round-trip times (ms)
-  private _elapsedMs: number
-  private _spawnAccumulator: number   // fractional packets owed since last spawn
+  private _completed: number
+  private _dropped: number
+  private _retransmits: number
+  private _recentRtts: number[]
+  private _spawnAccumulator: number
   private _lingerTimers: Map<string, number>
 
-  // Called each tick so React can re-render the dashboard / packet list
   onStateChange?: (stats: SimulationStats, packets: Packet[]) => void
 
   constructor() {
     this.graph = new NetworkGraph()
     this.packets = []
+    this._flows = []
     this._isPaused = false
     this._routingMode = 'shortest-path'
     this._isDDoS = false
-    this._deliveredPackets = 0
-    this._droppedPackets = 0
+    this._completed = 0
+    this._dropped = 0
+    this._retransmits = 0
     this._recentRtts = []
-    this._elapsedMs = 0
     this._spawnAccumulator = 0
     this._lingerTimers = new Map()
   }
 
-  // Main tick — deltaSeconds is real frame time, realTimeMs is a running clock.
   tick(deltaSeconds: number, realTimeMs: number): void {
     if (this._isPaused) return
 
-    this._elapsedMs += deltaSeconds * 1000
-
-    this._spawnPackets(deltaSeconds)
+    this._spawnFlows(deltaSeconds)
+    this._processFlows(realTimeMs)
     this._stepPackets(deltaSeconds, realTimeMs)
     this._pruneLingeredPackets(realTimeMs)
+    this._pruneFlows()
 
     this.onStateChange?.(this._buildStats(), this.packets)
   }
 
-  // Build a fresh request packet from a random home to a random server.
-  private _makeRequest(): Packet | null {
-    const homes = this.graph.getHomeIds()
-    const servers = this.graph.getServerIds()
-    if (homes.length === 0 || servers.length === 0) return null
-
-    const sourceId = homes[Math.floor(Math.random() * homes.length)]
-    const destId = servers[Math.floor(Math.random() * servers.length)]
-
-    const path = findShortestPath(
-      sourceId,
-      destId,
-      this.graph.getActiveNodes(),
-      this.graph.getActiveLinks(),
-    )
-
-    // No route (e.g. firewall blocking the data centers) → dropped packet.
-    if (!path) {
-      this._droppedPackets++
-      return null
-    }
-
-    return createPacket('request', sourceId, destId, path, this.graph.links, this._elapsedMs)
+  private _hasInflight(flowId: string): boolean {
+    return this.packets.some(p => p.flowId === flowId && p.status === 'in-flight')
   }
 
-  // When a request arrives at a server, the server replies: a response packet
-  // retraces the path back home. This models real request/response traffic.
-  private _makeResponse(request: Packet): Packet {
-    const reversedPath = [...request.path].reverse()
-    return createPacket(
-      'response',
-      request.destinationId,
-      request.sourceId,
-      reversedPath,
-      this.graph.links,
-      this._elapsedMs,
-    )
-  }
+  private _spawnFlows(deltaSeconds: number): void {
+    const active = this._flows.filter(f => !f.done).length
+    if (active >= MAX_FLOWS) return
+    if (this.packets.filter(p => p.status === 'in-flight').length >= MAX_ACTIVE_PACKETS) return
 
-  private _spawnPackets(deltaSeconds: number): void {
-    const activeCount = this.packets.filter(p => p.status === 'in-flight').length
-    if (activeCount >= MAX_ACTIVE_PACKETS) return
-
-    // Accumulate fractional packets so the rate is frame-rate independent.
-    // DDoS mode (placeholder) bursts traffic at 4x.
-    const rate = this._isDDoS ? PACKET_SPAWN_RATE * 4 : PACKET_SPAWN_RATE
+    const rate = this._isDDoS ? FLOW_SPAWN_RATE * 4 : FLOW_SPAWN_RATE
     this._spawnAccumulator += rate * deltaSeconds
-
     while (this._spawnAccumulator >= 1) {
       this._spawnAccumulator -= 1
-      const req = this._makeRequest()
-      if (req) this.packets.push(req)
+      this._createFlow()
+    }
+  }
+
+  private _createFlow(): void {
+    const homes = this.graph.getHomeIds()
+    const servers = this.graph.getServerIds()
+    if (homes.length === 0 || servers.length === 0) return
+
+    const srcId = homes[Math.floor(Math.random() * homes.length)]
+    const dstId = servers[Math.floor(Math.random() * servers.length)]
+    const fwdPath = findShortestPath(srcId, dstId, this.graph.getActiveNodes(), this.graph.getActiveLinks())
+
+    // No route (e.g. firewall up) → the connection attempt fails immediately.
+    if (!fwdPath) {
+      this._dropped++
+      return
+    }
+
+    const protocol = pickProtocol(this._isDDoS)
+    _flowCounter++
+    this._flows.push({
+      id: `flow-${_flowCounter}`,
+      protocol,
+      srcId,
+      dstId,
+      fwdPath,
+      revPath: [...fwdPath].reverse(),
+      srcPort: 49152 + Math.floor(Math.random() * 16000),
+      dstPort: destPort(protocol),
+      steps: buildSteps(protocol),
+      stepIndex: 0,
+      awaiting: false,
+      awaitingPacketId: null,
+      awaitingStep: null,
+      awaitingSince: 0,
+      retxCount: 0,
+      rttRecorded: false,
+      lastEmit: 0,
+      done: false,
+    })
+  }
+
+  private _emit(flow: Flow, step: FlowStep, now: number, retx: boolean): void {
+    const path = step.dir === 'fwd' ? flow.fwdPath : flow.revPath
+    const lossAt = Math.random() < LOSS_PROB ? 0.3 + Math.random() * 0.5 : null
+    const packet = createPacket({
+      flowId: flow.id,
+      protocol: flow.protocol,
+      segment: retx ? 'RETX' : step.segment,
+      sourceId: path[0],
+      destinationId: path[path.length - 1],
+      path,
+      links: this.graph.links,
+      simulationTimeMs: now,
+      lossAt,
+    })
+    this.packets.push(packet)
+    if (step.wait) flow.awaitingPacketId = packet.id
+  }
+
+  private _processFlows(now: number): void {
+    for (const flow of this._flows) {
+      if (flow.done) continue
+
+      // Finished emitting all steps → done once nothing is still in flight.
+      if (flow.stepIndex >= flow.steps.length) {
+        if (!this._hasInflight(flow.id)) {
+          flow.done = true
+          this._completed++
+        }
+        continue
+      }
+
+      if (flow.awaiting) {
+        // Awaited packet lost? Retransmit (TCP reliability) until we give up.
+        if (now - flow.awaitingSince > TCP_TIMEOUT_MS && !this._hasInflight(flow.id) && flow.awaitingStep) {
+          if (flow.retxCount < MAX_RETX) {
+            flow.retxCount++
+            this._retransmits++
+            this._emit(flow, flow.awaitingStep, now, true)
+            flow.awaitingSince = now
+          } else {
+            flow.done = true // connection reset / abandoned
+          }
+        }
+        continue
+      }
+
+      const step = flow.steps[flow.stepIndex]
+      if (!step.wait && now - flow.lastEmit < UDP_STAGGER_MS) continue
+
+      this._emit(flow, step, now, false)
+      flow.lastEmit = now
+      flow.stepIndex++
+      if (step.wait) {
+        flow.awaiting = true
+        flow.awaitingStep = step
+        flow.awaitingSince = now
+      }
     }
   }
 
   private _stepPackets(deltaSeconds: number, realTimeMs: number): void {
-    const newResponses: Packet[] = []
-
     for (const packet of this.packets) {
       if (packet.status !== 'in-flight') continue
-
-      const arrived = stepPacket(packet, deltaSeconds)
-      if (!arrived) continue
-
-      if (packet.kind === 'request') {
-        // Request reached the server → fire the response back home.
-        newResponses.push(this._makeResponse(packet))
+      const result = stepPacket(packet, deltaSeconds)
+      if (result === 'delivered') {
+        this._onDelivered(packet)
         this._lingerTimers.set(packet.id, realTimeMs + PACKET_LINGER_MS)
-      } else {
-        // Response reached home → a full round-trip is complete.
-        const rtt = computePathLatency(packet.path, this.graph.links) * 2
-        this._recentRtts.push(rtt)
-        if (this._recentRtts.length > LATENCY_WINDOW) this._recentRtts.shift()
-        this._deliveredPackets++
-        this._lingerTimers.set(packet.id, realTimeMs + PACKET_LINGER_MS)
+      } else if (result === 'dropped') {
+        this._dropped++
+        this._lingerTimers.set(packet.id, realTimeMs + 200)
       }
     }
+  }
 
-    if (newResponses.length) this.packets.push(...newResponses)
+  private _onDelivered(packet: Packet): void {
+    const flow = this._flows.find(f => f.id === packet.flowId)
+    if (!flow) return
+
+    // Record RTT when the first reply of the exchange comes back.
+    if (!flow.rttRecorded && (packet.segment === 'SYN-ACK' || packet.segment === 'REPLY')) {
+      const rtt =
+        computePathLatency(flow.fwdPath, this.graph.links) +
+        computePathLatency(flow.revPath, this.graph.links)
+      this._recentRtts.push(rtt)
+      if (this._recentRtts.length > LATENCY_WINDOW) this._recentRtts.shift()
+      flow.rttRecorded = true
+    }
+
+    if (flow.awaiting && packet.id === flow.awaitingPacketId) {
+      flow.awaiting = false
+      flow.awaitingPacketId = null
+      flow.awaitingStep = null
+      flow.retxCount = 0
+    }
   }
 
   private _pruneLingeredPackets(realTimeMs: number): void {
@@ -150,17 +299,32 @@ export class SimulationEngine {
     })
   }
 
+  private _pruneFlows(): void {
+    if (this._flows.length < 60) return
+    this._flows = this._flows.filter(f => !f.done || this._hasInflight(f.id))
+  }
+
   private _buildStats(): SimulationStats {
+    const protocolMix: Record<Protocol, number> = { TCP: 0, UDP: 0, ICMP: 0 }
+    let active = 0
+    for (const p of this.packets) {
+      if (p.status !== 'in-flight') continue
+      active++
+      protocolMix[p.protocol]++
+    }
     const avg =
       this._recentRtts.length > 0
         ? this._recentRtts.reduce((a, b) => a + b, 0) / this._recentRtts.length
         : 0
 
     return {
-      activePackets: this.packets.filter(p => p.status === 'in-flight').length,
-      deliveredPackets: this._deliveredPackets,
-      droppedPackets: this._droppedPackets,
+      activePackets: active,
+      connections: this._flows.filter(f => !f.done).length,
+      completed: this._completed,
+      droppedPackets: this._dropped,
+      retransmits: this._retransmits,
       averageLatency: Math.round(avg),
+      protocolMix,
       routingMode: this._routingMode,
       isPaused: this._isPaused,
     }
@@ -190,10 +354,11 @@ export class SimulationEngine {
   reset(): void {
     this.graph.reset()
     this.packets = []
-    this._deliveredPackets = 0
-    this._droppedPackets = 0
+    this._flows = []
+    this._completed = 0
+    this._dropped = 0
+    this._retransmits = 0
     this._recentRtts = []
-    this._elapsedMs = 0
     this._spawnAccumulator = 0
     this._lingerTimers.clear()
     this._isPaused = false

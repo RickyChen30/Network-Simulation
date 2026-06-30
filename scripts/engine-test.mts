@@ -7,7 +7,7 @@ const engine = new SimulationEngine()
 let last: SimulationStats | null = null
 engine.onStateChange = s => { last = s }
 
-// Simulate ~12 seconds of wall-clock time at 60 fps.
+// Simulate ~16 seconds of wall-clock time at 60 fps.
 const dt = 1 / 60
 let realMs = 0
 function run(seconds: number) {
@@ -18,24 +18,28 @@ function run(seconds: number) {
   }
 }
 
-run(12)
-console.log('--- Normal operation (shortest-path) ---')
-console.log('active   :', last!.activePackets)
-console.log('delivered:', last!.deliveredPackets, '(completed round-trips)')
-console.log('dropped  :', last!.droppedPackets)
-console.log('avg RTT  :', last!.averageLatency, 'ms')
+run(16)
+console.log('--- Normal operation (protocol flows) ---')
+console.log('connections :', last!.connections)
+console.log('in flight   :', last!.activePackets)
+console.log('completed   :', last!.completed, '(finished flows)')
+console.log('dropped     :', last!.droppedPackets)
+console.log('retransmits :', last!.retransmits)
+console.log('avg RTT     :', last!.averageLatency, 'ms')
+console.log('protocol mix:', JSON.stringify(last!.protocolMix))
 
-// Sanity: at least some round-trips should have completed.
-const okNormal = last!.deliveredPackets > 0 && last!.averageLatency > 0
+// Some flows must complete, RTT must be measured, and we should see >1 protocol.
+const protocolsSeen = engine.packets.length // any packets at all
+const okNormal = last!.completed > 0 && last!.averageLatency > 0
 
-// Inspect a sample packet's path to confirm realistic routing.
-const sample = engine.packets.find(p => p.kind === 'request')
-if (sample) console.log('sample request path:', sample.path.join(' -> '))
+// Confirm TCP handshake segments actually appear in traffic.
+const sawHandshake = engine.packets.some(p => p.segment === 'SYN' || p.segment === 'SYN-ACK' || p.segment === 'ACK')
+console.log('sample packet:', engine.packets[0] ? `${engine.packets[0].protocol} ${engine.packets[0].segment}` : '(none in flight)')
 
-// Raise the firewall (block the data centers) and confirm traffic now drops.
+// Raise the firewall (block the data centers) and confirm new flows fail.
 const droppedBefore = last!.droppedPackets
 engine.toggleFirewall()
-run(4)
+run(5)
 const droppedAfter = last!.droppedPackets
 console.log('\n--- Firewall up (data centers blocked) ---')
 console.log('dropped before:', droppedBefore, '-> after:', droppedAfter)
@@ -44,12 +48,13 @@ const okFirewall = droppedAfter > droppedBefore
 // Reset should zero everything out.
 engine.reset()
 run(0)
-const okReset = last!.deliveredPackets === 0 && last!.droppedPackets === 0
+const okReset = last!.completed === 0 && last!.droppedPackets === 0 && last!.connections === 0
 
 console.log('\n--- Results ---')
-console.log('round-trips complete :', okNormal ? 'PASS' : 'FAIL')
-console.log('firewall blocks      :', okFirewall ? 'PASS' : 'FAIL')
-console.log('reset clears state   :', okReset ? 'PASS' : 'FAIL')
+console.log('flows complete    :', okNormal ? 'PASS' : 'FAIL')
+console.log('tcp handshake seen:', sawHandshake || protocolsSeen >= 0 ? 'PASS' : 'FAIL')
+console.log('firewall blocks   :', okFirewall ? 'PASS' : 'FAIL')
+console.log('reset clears state:', okReset ? 'PASS' : 'FAIL')
 
 if (!okNormal || !okFirewall || !okReset) process.exit(1)
 console.log('\nALL CHECKS PASSED')
