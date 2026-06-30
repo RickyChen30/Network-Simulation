@@ -3,8 +3,9 @@ import { useFrame } from '@react-three/fiber'
 import { OrbitControls, Stars, Environment, Lightformer } from '@react-three/drei'
 import { EffectComposer, Bloom, Vignette } from '@react-three/postprocessing'
 import * as THREE from 'three'
-import type { Packet, SimulationStats } from '../types/network'
+import type { Packet, SimulationStats, NetworkNode } from '../types/network'
 import { SimulationEngine } from '../engine/simulation'
+import { angularDistance, GLOBE_RADIUS } from '../config/globe'
 import { NodeMesh } from './NodeMesh'
 import { LinkMesh } from './LinkMesh'
 import { PacketMesh } from './PacketMesh'
@@ -19,14 +20,44 @@ interface NetworkSceneProps {
   onFocus: (id: string | null) => void
 }
 
-// Reusable scratch vectors (avoid per-frame allocation during the camera fly).
+// Reusable scratch vector (avoid per-frame allocation).
 const _p = new THREE.Vector3()
-const _n = new THREE.Vector3()
-const _t = new THREE.Vector3()
-const _up = new THREE.Vector3(0, 1, 0)
-const _x = new THREE.Vector3(1, 0, 0)
 const DEFAULT_CAM = new THREE.Vector3(...CAMERA_POSITION)
 const DEFAULT_TGT = new THREE.Vector3(...CAMERA_TARGET)
+
+// Decide which nodes get a visible marker so co-located infrastructure doesn't
+// stack up (e.g. New York's IXP, its data center and servers become one city).
+// Servers are never drawn; other nodes are dropped if a higher-priority marker
+// already sits within ~140 km. Hidden nodes still exist for routing.
+const MARKER_PRIORITY: Record<string, number> = {
+  gateway: 4,
+  'core-router': 4,
+  home: 3,
+  'isp-router': 2,
+  'home-router': 1,
+  datacenter: 1,
+  server: -1,
+}
+const MARKER_MIN_ANGLE = 0.022 // radians (~140 km)
+
+function dedupeMarkers(nodes: NetworkNode[]): NetworkNode[] {
+  const sorted = [...nodes].sort(
+    (a, b) => (MARKER_PRIORITY[b.type] ?? 0) - (MARKER_PRIORITY[a.type] ?? 0),
+  )
+  const kept: NetworkNode[] = []
+  for (const n of sorted) {
+    if (n.type === 'server') continue
+    let overlaps = false
+    for (const k of kept) {
+      if (angularDistance(n.position, k.position) < MARKER_MIN_ANGLE) {
+        overlaps = true
+        break
+      }
+    }
+    if (!overlaps) kept.push(n)
+  }
+  return kept
+}
 
 // Root of the 3D world: the globe, the network laid over it, the camera fly-to,
 // and post-processing. The engine tick runs here via useFrame so simulation and
@@ -49,24 +80,42 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
   const { nodes, links } = engine.graph
   const nodeMap = useMemo(() => new Map(nodes.map(n => [n.id, n])), [nodes])
   const focusedNode = focusedId ? nodeMap.get(focusedId) : undefined
+  const markerNodes = useMemo(() => dedupeMarkers(nodes), [nodes])
+
+  // The continent of the clicked city, and its visible cities.
+  const focusedContinent = focusedNode?.continent
+  const continentCities = useMemo(
+    () => (focusedContinent ? markerNodes.filter(n => n.continent === focusedContinent) : []),
+    [markerNodes, focusedContinent],
+  )
+
+  // Camera framing for the focused continent (centroid + bounding radius).
+  const focusView = useMemo(() => {
+    if (continentCities.length === 0) return null
+    const sum = new THREE.Vector3()
+    for (const c of continentCities) sum.add(_p.set(...c.position))
+    const cn = sum.normalize()
+    const surface = cn.clone().multiplyScalar(GLOBE_RADIUS)
+    const surfaceArr: [number, number, number] = [surface.x, surface.y, surface.z]
+    let theta = 0
+    for (const c of continentCities) theta = Math.max(theta, angularDistance(surfaceArr, c.position))
+    const height = Math.min(28, Math.max(6, theta * 24 + 3))
+    let t = new THREE.Vector3(0, 1, 0).cross(cn)
+    if (t.lengthSq() < 1e-4) t = new THREE.Vector3(1, 0, 0).cross(cn)
+    t.normalize()
+    const cam = surface.clone().addScaledVector(cn, height).addScaledVector(t, height * 0.12)
+    return { cam, tgt: surface.clone() }
+  }, [continentCities])
 
   // Fill desiredCam / desiredTgt for the current focus target.
   const fillDesired = () => {
-    const node = focusedId ? nodeMap.get(focusedId) : undefined
-    if (!node) {
+    if (focusView) {
+      desiredCam.current.copy(focusView.cam)
+      desiredTgt.current.copy(focusView.tgt)
+    } else {
       desiredCam.current.copy(DEFAULT_CAM)
       desiredTgt.current.copy(DEFAULT_TGT)
-      return
     }
-    _p.set(...node.position)
-    _n.copy(_p).normalize()
-    _t.copy(_up).cross(_n)
-    if (_t.lengthSq() < 1e-4) _t.copy(_x).cross(_n)
-    _t.normalize()
-    // Look down almost vertically so the city reads cleanly on the map (a small
-    // tangential offset keeps a hint of 3D rather than a perfectly flat view).
-    desiredCam.current.copy(_p).addScaledVector(_n, 2.5).addScaledVector(_t, 0.45)
-    desiredTgt.current.copy(_p).addScaledVector(_n, 0.05)
   }
 
   useFrame(({ camera }) => {
@@ -100,8 +149,8 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
         animatingRef.current = false
         controls.enabled = true
         controls.autoRotate = !focusedId
-        controls.minDistance = focusedId ? 0.8 : 12
-        controls.maxDistance = focusedId ? 12 : 45
+        controls.minDistance = focusedId ? 3 : 12
+        controls.maxDistance = focusedId ? 55 : 45
         controls.update()
       }
     }
@@ -146,18 +195,21 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
       {/* The Earth */}
       <Globe />
 
-      {/* A detailed city appears at the focused location */}
-      {focusedNode && <CityDetail node={focusedNode} />}
+      {/* Continent view: when a city is clicked, every city on its continent
+          becomes a building cluster (compact, no per-city local network). */}
+      {continentCities.map(city => (
+        <CityDetail key={city.id} node={city} radius={0.55} maxBuildings={80} showNetwork={false} />
+      ))}
 
       {/* Cable arcs first, then city markers on top */}
       {links.map(link => (
         <LinkMesh key={link.id} link={link} nodes={nodes} />
       ))}
 
-      {/* City markers — the focused city's marker is hidden, since its detailed
-          cityscape + local-network hub stand in for it. */}
-      {nodes
-        .filter(node => node.id !== focusedId)
+      {/* City markers — de-duplicated so each metro shows one point. Cities on
+          the focused continent are hidden (their building clusters stand in). */}
+      {markerNodes
+        .filter(node => node.continent !== focusedContinent)
         .map(node => (
           <NodeMesh key={node.id} node={node} showLabel={!focusedId} onFocus={onFocus} />
         ))}

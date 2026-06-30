@@ -7,8 +7,6 @@ const TIER_ORDER: NodeType[] = [
   'home',
   'core-router',
   'gateway',
-  'datacenter',
-  'server',
 ]
 
 export function Legend() {

@@ -46,6 +46,8 @@ export interface NetworkNode {
   subLabel?: string
   // Assigned IP address (for a realistic, inspectable network)
   ip: string
+  // Continent the node sits on (used to group the continent zoom view)
+  continent: string
   // 3D position in world space (X = east, Z = south, Y = up)
   position: [number, number, number]
   // Whether this node is currently forwarding traffic (firewall toggle flips datacenters)

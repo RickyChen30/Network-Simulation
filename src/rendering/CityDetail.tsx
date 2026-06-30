@@ -8,6 +8,11 @@ import { earthLoaded, onEarthLoaded, isWater } from '../config/earthSampler'
 
 interface CityDetailProps {
   node: NetworkNode
+  // Building-cluster radius; smaller for the zoomed-out continent view.
+  radius?: number
+  maxBuildings?: number
+  // Show the per-city local network (hub, links, packets). Off in continent view.
+  showNetwork?: boolean
 }
 
 type V3 = [number, number, number]
@@ -28,7 +33,6 @@ const TOWER_COLORS = ['#3c4250', '#454b57', '#2f3b46', '#3e4654', '#343a44']
 const HOUSE_COLORS = ['#6b5644', '#7a6450', '#5e5346', '#84654a', '#6f5a48', '#574d40']
 const LIGHT_COLORS = ['#ffe6a3', '#ffd28a', '#fff4d6', '#cfe3ff']
 
-const R = 1.1
 const GROUND_Y = 0.02 // local height of the network layer above the city ground
 const UPLINK: V3 = [0, 0.78, 0] // the city's link up to the global internet
 
@@ -112,9 +116,10 @@ function CityPackets({ hub, houses }: { hub: V3; houses: House[] }) {
   )
 }
 
-// The focused city: buildings on the real land, plus a live local network with
-// packets running between the houses and in/out of the city.
-export function CityDetail({ node }: CityDetailProps) {
+// A city: buildings on the real land, optionally with a live local network of
+// packets. Used both for a single focused city and for every city when zoomed
+// out to a whole continent (smaller radius, network off).
+export function CityDetail({ node, radius = 1.1, maxBuildings = 240, showNetwork = true }: CityDetailProps) {
   const [ready, setReady] = useState(earthLoaded())
   useEffect(() => {
     if (!ready) onEarthLoaded(() => setReady(true))
@@ -126,6 +131,7 @@ export function CityDetail({ node }: CityDetailProps) {
   }, [node.position])
 
   const { buildings, lights, houses, links } = useMemo(() => {
+    const R = radius
     const rng = makeRng(node.id)
     const base = new THREE.Vector3(...node.position)
     const tmp = new THREE.Vector3()
@@ -142,7 +148,7 @@ export function CityDetail({ node }: CityDetailProps) {
     }
 
     let attempts = 0
-    while (buildings.length < 240 && attempts < 2000) {
+    while (buildings.length < maxBuildings && attempts < maxBuildings * 9) {
       attempts++
       const ang = rng() * Math.PI * 2
       const dist = R * Math.pow(rng(), 0.5)
@@ -172,60 +178,63 @@ export function CityDetail({ node }: CityDetailProps) {
       }
     }
 
-    // --- Local network: a hub at the city center, neighborhood routers, and
-    // houses wired to their nearest router. ---
-    const hub: V3 = [0, GROUND_Y, 0]
-    const distNodes: V3[] = []
-    for (let k = 0; k < 5; k++) {
-      let placed = false
-      for (let tryI = 0; tryI < 6 && !placed; tryI++) {
-        const ang = (k / 5) * Math.PI * 2 + rng() * 0.7
-        const rad = 0.35 + tryI * 0.12 + rng() * 0.08
-        const lx = Math.cos(ang) * rad
-        const lz = Math.sin(ang) * rad
-        if (onLand(lx, lz)) {
-          distNodes.push([lx, GROUND_Y, lz])
-          placed = true
-        }
-      }
-      if (!placed) {
-        const ang = (k / 5) * Math.PI * 2
-        distNodes.push([Math.cos(ang) * 0.4, GROUND_Y, Math.sin(ang) * 0.4])
-      }
-    }
-
-    const nearestDist = (x: number, z: number): V3 => {
-      let best = distNodes[0]
-      let bd = Infinity
-      for (const dn of distNodes) {
-        const dx = dn[0] - x
-        const dz = dn[2] - z
-        const dd = dx * dx + dz * dz
-        if (dd < bd) {
-          bd = dd
-          best = dn
-        }
-      }
-      return best
-    }
-
-    const candidates = buildings.filter(b => {
-      const dd = Math.hypot(b.x, b.z)
-      return dd > 0.12 && dd < R * 0.95
-    })
     const houses: House[] = []
-    const step = Math.max(1, Math.floor(candidates.length / 18))
-    for (let i = 0; i < candidates.length && houses.length < 18; i += step) {
-      const b = candidates[i]
-      houses.push({ pos: [b.x, GROUND_Y, b.z], dist: nearestDist(b.x, b.z) })
+    const links: { a: V3; b: V3; trunk: boolean }[] = []
+
+    // --- Local network: a hub at the city center, neighborhood routers, and
+    // houses wired to their nearest router (only for the single-city view). ---
+    if (showNetwork) {
+      const hub: V3 = [0, GROUND_Y, 0]
+      const distNodes: V3[] = []
+      for (let k = 0; k < 5; k++) {
+        let placed = false
+        for (let tryI = 0; tryI < 6 && !placed; tryI++) {
+          const ang = (k / 5) * Math.PI * 2 + rng() * 0.7
+          const rad = 0.35 + tryI * 0.12 + rng() * 0.08
+          const lx = Math.cos(ang) * rad
+          const lz = Math.sin(ang) * rad
+          if (onLand(lx, lz)) {
+            distNodes.push([lx, GROUND_Y, lz])
+            placed = true
+          }
+        }
+        if (!placed) {
+          const ang = (k / 5) * Math.PI * 2
+          distNodes.push([Math.cos(ang) * 0.4, GROUND_Y, Math.sin(ang) * 0.4])
+        }
+      }
+
+      const nearestDist = (x: number, z: number): V3 => {
+        let best = distNodes[0]
+        let bd = Infinity
+        for (const dn of distNodes) {
+          const dx = dn[0] - x
+          const dz = dn[2] - z
+          const dd = dx * dx + dz * dz
+          if (dd < bd) {
+            bd = dd
+            best = dn
+          }
+        }
+        return best
+      }
+
+      const candidates = buildings.filter(b => {
+        const dd = Math.hypot(b.x, b.z)
+        return dd > 0.12 && dd < R * 0.95
+      })
+      const step = Math.max(1, Math.floor(candidates.length / 18))
+      for (let i = 0; i < candidates.length && houses.length < 18; i += step) {
+        const b = candidates[i]
+        houses.push({ pos: [b.x, GROUND_Y, b.z], dist: nearestDist(b.x, b.z) })
+      }
+
+      for (const dn of distNodes) links.push({ a: hub, b: dn, trunk: true })
+      for (const h of houses) links.push({ a: h.dist, b: h.pos, trunk: false })
     }
 
-    const links: { a: V3; b: V3; trunk: boolean }[] = []
-    for (const dn of distNodes) links.push({ a: hub, b: dn, trunk: true })
-    for (const h of houses) links.push({ a: h.dist, b: h.pos, trunk: false })
-
-    return { buildings, lights, houses, links, hub }
-  }, [node.id, ready, quaternion])
+    return { buildings, lights, houses, links }
+  }, [node.id, ready, quaternion, radius, maxBuildings, showNetwork])
 
   const hub: V3 = [0, GROUND_Y, 0]
 
@@ -249,33 +258,37 @@ export function CityDetail({ node }: CityDetailProps) {
         ))}
       </Instances>
 
-      {/* Local network links */}
-      {links.map((l, i) => (
-        <Line
-          key={i}
-          points={[l.a, l.b]}
-          color={l.trunk ? '#5cc8f5' : '#46a0c4'}
-          lineWidth={l.trunk ? 1.4 : 1}
-          transparent
-          opacity={l.trunk ? 0.8 : 0.5}
-        />
-      ))}
+      {showNetwork && (
+        <>
+          {/* Local network links */}
+          {links.map((l, i) => (
+            <Line
+              key={i}
+              points={[l.a, l.b]}
+              color={l.trunk ? '#5cc8f5' : '#46a0c4'}
+              lineWidth={l.trunk ? 1.4 : 1}
+              transparent
+              opacity={l.trunk ? 0.8 : 0.5}
+            />
+          ))}
 
-      {/* Uplink to the global internet (vertical beam) */}
-      <Line points={[hub, UPLINK]} color="#5eead4" lineWidth={1.6} transparent opacity={0.75} />
-      <mesh position={UPLINK}>
-        <sphereGeometry args={[0.03, 12, 12]} />
-        <meshBasicMaterial color="#5eead4" toneMapped={false} />
-      </mesh>
+          {/* Uplink to the global internet (vertical beam) */}
+          <Line points={[hub, UPLINK]} color="#5eead4" lineWidth={1.6} transparent opacity={0.75} />
+          <mesh position={UPLINK}>
+            <sphereGeometry args={[0.03, 12, 12]} />
+            <meshBasicMaterial color="#5eead4" toneMapped={false} />
+          </mesh>
 
-      {/* Hub marker */}
-      <mesh position={hub}>
-        <sphereGeometry args={[0.035, 14, 14]} />
-        <meshBasicMaterial color="#5eead4" toneMapped={false} />
-      </mesh>
+          {/* Hub marker */}
+          <mesh position={hub}>
+            <sphereGeometry args={[0.035, 14, 14]} />
+            <meshBasicMaterial color="#5eead4" toneMapped={false} />
+          </mesh>
 
-      {/* Live packets */}
-      <CityPackets hub={hub} houses={houses} />
+          {/* Live packets */}
+          <CityPackets hub={hub} houses={houses} />
+        </>
+      )}
     </group>
   )
 }

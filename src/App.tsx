@@ -101,10 +101,9 @@ export default function App() {
       {focusedNode ? (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-slate-950/75 backdrop-blur-md border border-white/10 rounded-xl px-4 py-2.5 shadow-2xl">
           <div className="text-center">
-            <div className="text-sm font-semibold text-white tracking-wide">{focusedNode.label}</div>
-            <div className="text-[11px] text-teal-300/80 font-mono">
-              {focusedNode.ip}
-              {focusedNode.subLabel ? ` · ${focusedNode.subLabel}` : ''}
+            <div className="text-sm font-semibold text-white tracking-wide">{focusedNode.continent}</div>
+            <div className="text-[11px] text-teal-300/80">
+              from {focusedNode.label}
             </div>
           </div>
           <button

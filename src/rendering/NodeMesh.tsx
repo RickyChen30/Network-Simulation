@@ -40,17 +40,22 @@ export function NodeMesh({ node, showLabel, onFocus }: NodeMeshProps) {
 
   const phase = useMemo(() => Math.random() * Math.PI * 2, [])
 
+  // Metro cities label only when zoomed in (avoids a wall of labels on the
+  // full-globe view); backbone hubs / data centers / servers always label.
+  const isCity = node.type === 'home'
+
   useFrame(({ clock, camera }) => {
     if (haloRef.current) {
       const t = clock.getElapsedTime()
       haloRef.current.scale.setScalar(1 + Math.sin(t * 2 + phase) * 0.18)
     }
-    // Fade the label when the city is on the hemisphere facing away from camera.
     if (labelRef.current) {
       const cp = camera.position
       const cl = Math.hypot(cp.x, cp.y, cp.z) || 1
+      // Hide labels on the far hemisphere, and city labels when zoomed out.
       const facing = (normal[0] * cp.x + normal[1] * cp.y + normal[2] * cp.z) / cl
-      labelRef.current.style.opacity = String(facing > 0.05 ? labelOpacity : 0)
+      const visible = facing > 0.05 && !(isCity && cl > 22)
+      labelRef.current.style.opacity = String(visible ? labelOpacity : 0)
     }
   })
 
