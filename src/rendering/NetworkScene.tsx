@@ -24,6 +24,8 @@ interface NetworkSceneProps {
 const _p = new THREE.Vector3()
 const DEFAULT_CAM = new THREE.Vector3(...CAMERA_POSITION)
 const DEFAULT_TGT = new THREE.Vector3(...CAMERA_TARGET)
+// Distance from globe center for the full-world view.
+const GLOBAL_DIST = Math.hypot(...CAMERA_POSITION)
 
 // Decide which nodes get a visible marker so co-located infrastructure doesn't
 // stack up (e.g. New York's IXP, its data center and servers become one city).
@@ -72,6 +74,9 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
   const prevFocusRef = useRef<string | null>(null)
   const desiredCam = useRef(new THREE.Vector3())
   const desiredTgt = useRef(new THREE.Vector3())
+  // Direction of the last clicked city, so ESC returns to a world view centered
+  // on it rather than always snapping back to the default (Americas) view.
+  const returnDirRef = useRef<THREE.Vector3 | null>(null)
 
   useEffect(() => {
     engine.onStateChange = onStatsChange
@@ -112,6 +117,10 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
     if (focusView) {
       desiredCam.current.copy(focusView.cam)
       desiredTgt.current.copy(focusView.tgt)
+    } else if (returnDirRef.current) {
+      // Zoom back out but keep the clicked city centered in the world view.
+      desiredCam.current.copy(returnDirRef.current).multiplyScalar(GLOBAL_DIST)
+      desiredTgt.current.set(0, 0, 0)
     } else {
       desiredCam.current.copy(DEFAULT_CAM)
       desiredTgt.current.copy(DEFAULT_TGT)
@@ -129,6 +138,11 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
     // Begin a fly whenever the focus target changes.
     if (prevFocusRef.current !== focusedId) {
       prevFocusRef.current = focusedId
+      // Remember the clicked city's direction for the ESC return view.
+      if (focusedId) {
+        const fn = nodeMap.get(focusedId)
+        if (fn) returnDirRef.current = new THREE.Vector3(...fn.position).normalize()
+      }
       animatingRef.current = true
       controls.enabled = false
       controls.autoRotate = false
