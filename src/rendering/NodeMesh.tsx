@@ -8,12 +8,15 @@ import { NODE_SIZE, NODE_GLOW } from '../config/constants'
 
 interface NodeMeshProps {
   node: NetworkNode
+  showLabel: boolean
+  onFocus: (id: string) => void
 }
 
 // A glowing marker sitting on the globe surface, with a soft pulsing halo and a
-// label offset radially outward. The label fades out when the city rotates to
-// the far side of the globe, so it never shows through the planet.
-export function NodeMesh({ node }: NodeMeshProps) {
+// clickable label offset radially outward. Clicking the marker or its label
+// flies the camera into that city. The label fades out when the city rotates to
+// the far side of the globe so it never shows through the planet.
+export function NodeMesh({ node, showLabel, onFocus }: NodeMeshProps) {
   const haloRef = useRef<THREE.Mesh>(null)
   const labelRef = useRef<HTMLDivElement>(null)
 
@@ -51,6 +54,11 @@ export function NodeMesh({ node }: NodeMeshProps) {
     }
   })
 
+  const focus = (e: { stopPropagation: () => void }) => {
+    e.stopPropagation()
+    onFocus(node.id)
+  }
+
   return (
     <group position={node.position}>
       {/* Soft halo */}
@@ -59,8 +67,12 @@ export function NodeMesh({ node }: NodeMeshProps) {
         <meshBasicMaterial color={color} transparent opacity={0.18 * opacity} depthWrite={false} />
       </mesh>
 
-      {/* Marker core */}
-      <mesh>
+      {/* Marker core (clickable) */}
+      <mesh
+        onClick={focus}
+        onPointerOver={() => (document.body.style.cursor = 'pointer')}
+        onPointerOut={() => (document.body.style.cursor = 'auto')}
+      >
         <sphereGeometry args={[size, 20, 20]} />
         <meshStandardMaterial
           color={color}
@@ -72,19 +84,22 @@ export function NodeMesh({ node }: NodeMeshProps) {
         />
       </mesh>
 
-      {/* Label */}
-      <Html position={labelPos} center distanceFactor={22} zIndexRange={[10, 0]}>
-        <div
-          ref={labelRef}
-          style={{ pointerEvents: 'none', opacity: labelOpacity }}
-          className="px-1.5 py-0.5 rounded text-center whitespace-nowrap text-slate-100 bg-slate-950/65 border border-white/10"
-        >
-          <div className="text-[11px] font-medium tracking-wide leading-tight">{node.label}</div>
-          {node.subLabel && (
-            <div className="text-[9px] text-slate-400 leading-tight">{node.subLabel}</div>
-          )}
-        </div>
-      </Html>
+      {/* Label (clickable) — hidden while a city is focused, to keep it clean */}
+      {showLabel && (
+        <Html position={labelPos} center distanceFactor={22} zIndexRange={[10, 0]}>
+          <div
+            ref={labelRef}
+            onClick={focus}
+            style={{ cursor: 'pointer', pointerEvents: 'auto', opacity: labelOpacity }}
+            className="px-1.5 py-0.5 rounded text-center whitespace-nowrap text-slate-100 bg-slate-950/65 border border-white/10 hover:border-teal-300/60 transition-colors"
+          >
+            <div className="text-[11px] font-medium tracking-wide leading-tight">{node.label}</div>
+            {node.subLabel && (
+              <div className="text-[9px] text-slate-400 leading-tight">{node.subLabel}</div>
+            )}
+          </div>
+        </Html>
+      )}
     </group>
   )
 }

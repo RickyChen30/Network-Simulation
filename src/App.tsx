@@ -26,10 +26,16 @@ export default function App() {
   // updated imperatively in PacketMesh, bypassing React state for performance.
   const [, setPackets] = useState<Packet[]>([])
 
+  // Which city the camera has flown into (null = whole-globe view).
+  const [focusedId, setFocusedId] = useState<string | null>(null)
+  const focusedNode = focusedId ? engine.graph.nodes.find(n => n.id === focusedId) : undefined
+
   const handleStatsChange = useCallback((newStats: SimulationStats, newPackets: Packet[]) => {
     setStats(newStats)
     setPackets(newPackets)
   }, [])
+
+  const handleFocus = useCallback((id: string | null) => setFocusedId(id), [])
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -55,6 +61,9 @@ export default function App() {
         case 'KeyF':
           engine.toggleFirewall()
           break
+        case 'Escape':
+          setFocusedId(null)
+          break
       }
     }
 
@@ -69,15 +78,43 @@ export default function App() {
         gl={{ antialias: true, alpha: false, powerPreference: 'high-performance' }}
         dpr={[1, 2]}
         style={{ width: '100%', height: '100%' }}
+        onPointerMissed={() => setFocusedId(null)}
       >
         <color attach="background" args={['#01030a']} />
-        <NetworkScene engine={engine} onStatsChange={handleStatsChange} />
+        <NetworkScene
+          engine={engine}
+          onStatsChange={handleStatsChange}
+          focusedId={focusedId}
+          onFocus={handleFocus}
+        />
       </Canvas>
 
       {/* HUD overlays */}
       <Dashboard stats={stats} />
       <Legend />
       <Controls />
+
+      {/* Focused-city banner */}
+      {focusedNode ? (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-slate-950/75 backdrop-blur-md border border-white/10 rounded-xl px-4 py-2.5 shadow-2xl">
+          <div className="text-center">
+            <div className="text-sm font-semibold text-white tracking-wide">{focusedNode.label}</div>
+            {focusedNode.subLabel && (
+              <div className="text-[11px] text-teal-300/80">{focusedNode.subLabel}</div>
+            )}
+          </div>
+          <button
+            onClick={() => setFocusedId(null)}
+            className="text-xs text-slate-300 hover:text-white bg-white/10 hover:bg-white/20 border border-white/15 rounded-lg px-2.5 py-1 transition-colors"
+          >
+            ← Back to globe
+          </button>
+        </div>
+      ) : (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 text-[11px] text-slate-500 tracking-wide pointer-events-none select-none">
+          Click a city to zoom in
+        </div>
+      )}
 
       {/* Title */}
       <div className="absolute bottom-4 right-4 text-right pointer-events-none select-none">

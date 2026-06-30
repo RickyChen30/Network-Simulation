@@ -12,7 +12,8 @@ retraces the route home. A request to a nearby data center returns in tens of
 milliseconds; one that has to cross an ocean takes much longer.
 
 **Navigate the globe:** drag to spin it, scroll to zoom; it also auto-rotates
-gently on its own.
+gently on its own. **Click any city** to fly down to it and reveal a detailed
+night-time cityscape on the surface; press `Esc` or "Back to globe" to fly out.
 
 ## Setup
 
@@ -36,6 +37,8 @@ Then open [http://localhost:5173](http://localhost:5173).
 | A      | Toggle adaptive routing (placeholder for now)         |
 | D      | DDoS burst — floods the network at 4× traffic         |
 | F      | Toggle the data-center firewalls (blocks their servers) |
+| Esc    | Fly back out to the whole-globe view                  |
+| Click  | Click a city to fly in and reveal its cityscape       |
 | Drag   | Spin the globe                                        |
 | Scroll | Zoom in / out                                         |
 
@@ -94,8 +97,9 @@ src/
     packet.ts             # packet lifecycle, segment timing, interpolation
   rendering/              # React Three Fiber scene
     NetworkScene.tsx      # scene root: lights, bloom, environment, ticks engine
-    Globe.tsx             # Earth sphere, lat/long graticule, atmosphere glow
-    NodeMesh.tsx          # glowing city marker + camera-facing label
+    Globe.tsx             # textured Earth, lat/long graticule, atmosphere glow
+    CityDetail.tsx        # procedural cityscape shown when a city is focused
+    NodeMesh.tsx          # glowing, clickable city marker + camera-facing label
     LinkMesh.tsx          # great-circle cable arcs with animated data-flow dashes
     PacketMesh.tsx        # comet-trailed packet spheres riding the arcs
   ui/                     # HTML/Tailwind HUD overlays

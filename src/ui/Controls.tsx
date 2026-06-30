@@ -11,6 +11,7 @@ const BINDINGS: Binding[] = [
   { key: 'A', label: 'Adaptive routing' },
   { key: 'D', label: 'DDoS burst' },
   { key: 'F', label: 'Toggle firewall' },
+  { key: 'ESC', label: 'Back to globe' },
 ]
 
 export function Controls() {
@@ -29,6 +30,7 @@ export function Controls() {
       </div>
       <p className="text-[10px] text-slate-500 mt-2.5 pt-2.5 border-t border-white/5">
         Drag to orbit · scroll to zoom
+        <br />Click a city to fly in
       </p>
     </div>
   )
