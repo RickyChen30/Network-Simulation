@@ -63,10 +63,10 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
     _t.copy(_up).cross(_n)
     if (_t.lengthSq() < 1e-4) _t.copy(_x).cross(_n)
     _t.normalize()
-    // Look down almost vertically so the city plan reads cleanly (a small
-    // tangential offset keeps a hint of 3D rather than a perfectly flat map).
-    desiredCam.current.copy(_p).addScaledVector(_n, 3.2).addScaledVector(_t, 0.55)
-    desiredTgt.current.copy(_p).addScaledVector(_n, 0.1)
+    // Look down almost vertically so the city reads cleanly on the map (a small
+    // tangential offset keeps a hint of 3D rather than a perfectly flat view).
+    desiredCam.current.copy(_p).addScaledVector(_n, 2.5).addScaledVector(_t, 0.45)
+    desiredTgt.current.copy(_p).addScaledVector(_n, 0.05)
   }
 
   useFrame(({ camera }) => {

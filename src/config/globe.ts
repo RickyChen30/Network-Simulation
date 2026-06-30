@@ -18,6 +18,16 @@ export function latLongToVec3(lat: number, long: number, radius = GLOBE_RADIUS):
   ]
 }
 
+// Inverse of latLongToVec3: a point in space → [lat, long] in degrees.
+export function vec3ToLatLong(v: Vec3): [number, number] {
+  const r = Math.hypot(v[0], v[1], v[2]) || 1
+  const lat = 90 - (Math.acos(Math.max(-1, Math.min(1, v[1] / r))) * 180) / Math.PI
+  let long = (Math.atan2(v[2], -v[0]) * 180) / Math.PI - 180
+  while (long < -180) long += 360
+  while (long > 180) long -= 360
+  return [lat, long]
+}
+
 function normalize(v: Vec3): Vec3 {
   const len = Math.hypot(v[0], v[1], v[2]) || 1
   return [v[0] / len, v[1] / len, v[2] / len]
