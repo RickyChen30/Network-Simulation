@@ -159,6 +159,21 @@ export function NetworkScene({
     }
   }
 
+  // Stop riding a packet and animate the camera back out to the world view.
+  const startReturnToWorld = () => {
+    const controls = controlsRef.current
+    followActiveRef.current = false
+    onSelectPacket(null)
+    onFocus(null)
+    animatingRef.current = true
+    if (controls) {
+      controls.enabled = false
+      controls.autoRotate = false
+      controls.minDistance = 0.4
+      controls.maxDistance = 60
+    }
+  }
+
   useFrame(({ camera }) => {
     const delta = Math.min(clockRef.current.getDelta(), 0.1)
     realTimeRef.current += delta * 1000
@@ -191,12 +206,13 @@ export function NetworkScene({
         if (dir.lengthSq() < 1e-6) dir.copy(outward)
         dir.normalize()
 
-        // Chase cam: slightly behind and above the packet, looking ahead.
+        // Chase cam: kept well behind and above the packet so there's context
+        // around it (not glued to the surface), looking ahead along its path.
         const camPos = followPosRef.current
           .clone()
-          .addScaledVector(dir, -1.3)
-          .addScaledVector(outward, 1.0)
-        camera.position.lerp(camPos, 0.18)
+          .addScaledVector(dir, -3.2)
+          .addScaledVector(outward, 3.0)
+        camera.position.lerp(camPos, 0.15)
         camera.lookAt(followAheadRef.current)
         return
       }
@@ -206,20 +222,15 @@ export function NetworkScene({
         return
       }
       if (followActiveRef.current) {
-        followActiveRef.current = false
-        controls.enabled = true
-        controls.target.set(0, 0, 0)
-        controls.update()
-        onSelectPacket(null)
+        // The flow finished — fly back out to the world view.
+        startReturnToWorld()
       }
       return
     }
     if (followActiveRef.current) {
-      // Deselected by the user — hand control back.
-      followActiveRef.current = false
-      controls.enabled = true
-      controls.target.set(0, 0, 0)
-      controls.update()
+      // Deselected by the user — fly back out to the world view.
+      startReturnToWorld()
+      return
     }
 
     // Begin a fly whenever the focus target or view mode changes.
@@ -320,7 +331,12 @@ export function NetworkScene({
           viewMode === 'continent' ? node.continent !== focusedContinent : node.id !== focusedId,
         )
         .map(node => (
-          <NodeMesh key={node.id} node={node} showLabel={!focusedId} onFocus={onFocus} />
+          <NodeMesh
+            key={node.id}
+            node={node}
+            showLabel={!focusedId && !selectedFlowId}
+            onFocus={onFocus}
+          />
         ))}
 
       {packets.map(packet => (
