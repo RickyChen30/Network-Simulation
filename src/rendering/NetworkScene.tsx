@@ -17,6 +17,7 @@ interface NetworkSceneProps {
   engine: SimulationEngine
   onStatsChange: (stats: SimulationStats, packets: Packet[]) => void
   focusedId: string | null
+  viewMode: 'city' | 'continent'
   onFocus: (id: string | null) => void
 }
 
@@ -64,7 +65,7 @@ function dedupeMarkers(nodes: NetworkNode[]): NetworkNode[] {
 // Root of the 3D world: the globe, the network laid over it, the camera fly-to,
 // and post-processing. The engine tick runs here via useFrame so simulation and
 // render stay in sync.
-export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: NetworkSceneProps) {
+export function NetworkScene({ engine, onStatsChange, focusedId, viewMode, onFocus }: NetworkSceneProps) {
   const clockRef = useRef(new THREE.Clock())
   const realTimeRef = useRef(0)
 
@@ -94,8 +95,23 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
     [markerNodes, focusedContinent],
   )
 
-  // Camera framing for the focused continent (centroid + bounding radius).
+  // Camera framing for the focus target: a single city, or the whole continent.
   const focusView = useMemo(() => {
+    if (!focusedNode) return null
+
+    if (viewMode === 'city') {
+      // Fly down close to the single clicked city (near-vertical).
+      const p = new THREE.Vector3(...focusedNode.position)
+      const n = p.clone().normalize()
+      let t = new THREE.Vector3(0, 1, 0).cross(n)
+      if (t.lengthSq() < 1e-4) t = new THREE.Vector3(1, 0, 0).cross(n)
+      t.normalize()
+      const cam = p.clone().addScaledVector(n, 2.5).addScaledVector(t, 0.45)
+      const tgt = p.clone().addScaledVector(n, 0.05)
+      return { cam, tgt }
+    }
+
+    // Continent view: frame the whole continent (centroid + bounding radius).
     if (continentCities.length === 0) return null
     const sum = new THREE.Vector3()
     for (const c of continentCities) sum.add(_p.set(...c.position))
@@ -110,7 +126,7 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
     t.normalize()
     const cam = surface.clone().addScaledVector(cn, height).addScaledVector(t, height * 0.12)
     return { cam, tgt: surface.clone() }
-  }, [continentCities])
+  }, [focusedNode, viewMode, continentCities])
 
   // Fill desiredCam / desiredTgt for the current focus target.
   const fillDesired = () => {
@@ -135,9 +151,10 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
     const controls = controlsRef.current
     if (!controls) return
 
-    // Begin a fly whenever the focus target changes.
-    if (prevFocusRef.current !== focusedId) {
-      prevFocusRef.current = focusedId
+    // Begin a fly whenever the focus target or view mode changes.
+    const key = focusedId ? `${focusedId}:${viewMode}` : null
+    if (prevFocusRef.current !== key) {
+      prevFocusRef.current = key
       // Remember the clicked city's direction for the ESC return view.
       if (focusedId) {
         const fn = nodeMap.get(focusedId)
@@ -163,8 +180,8 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
         animatingRef.current = false
         controls.enabled = true
         controls.autoRotate = !focusedId
-        controls.minDistance = focusedId ? 3 : 12
-        controls.maxDistance = focusedId ? 55 : 45
+        controls.minDistance = focusedId ? (viewMode === 'continent' ? 3 : 0.8) : 12
+        controls.maxDistance = focusedId ? (viewMode === 'continent' ? 55 : 14) : 45
         controls.update()
       }
     }
@@ -209,21 +226,28 @@ export function NetworkScene({ engine, onStatsChange, focusedId, onFocus }: Netw
       {/* The Earth */}
       <Globe />
 
-      {/* Continent view: when a city is clicked, every city on its continent
-          becomes a building cluster (compact, no per-city local network). */}
-      {continentCities.map(city => (
-        <CityDetail key={city.id} node={city} radius={0.55} maxBuildings={80} showNetwork={false} />
-      ))}
+      {/* City view: just the clicked city, with its detailed local network. */}
+      {focusedNode && viewMode === 'city' && <CityDetail node={focusedNode} />}
+
+      {/* Continent view: every city on the continent as a compact building
+          cluster (no per-city local network). */}
+      {viewMode === 'continent' &&
+        continentCities.map(city => (
+          <CityDetail key={city.id} node={city} radius={0.55} maxBuildings={80} showNetwork={false} />
+        ))}
 
       {/* Cable arcs first, then city markers on top */}
       {links.map(link => (
         <LinkMesh key={link.id} link={link} nodes={nodes} />
       ))}
 
-      {/* City markers — de-duplicated so each metro shows one point. Cities on
-          the focused continent are hidden (their building clusters stand in). */}
+      {/* City markers — de-duplicated so each metro shows one point. Hidden for
+          the focused city (city view) or the whole continent (continent view),
+          since their building clusters stand in. */}
       {markerNodes
-        .filter(node => node.continent !== focusedContinent)
+        .filter(node =>
+          viewMode === 'continent' ? node.continent !== focusedContinent : node.id !== focusedId,
+        )
         .map(node => (
           <NodeMesh key={node.id} node={node} showLabel={!focusedId} onFocus={onFocus} />
         ))}

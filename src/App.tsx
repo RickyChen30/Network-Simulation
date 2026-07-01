@@ -29,8 +29,10 @@ export default function App() {
   // updated imperatively in PacketMesh, bypassing React state for performance.
   const [, setPackets] = useState<Packet[]>([])
 
-  // Which city the camera has flown into (null = whole-globe view).
+  // Which city the camera has flown into (null = whole-globe view), and whether
+  // we're viewing just that city or its whole continent.
   const [focusedId, setFocusedId] = useState<string | null>(null)
+  const [viewMode, setViewMode] = useState<'city' | 'continent'>('city')
   const focusedNode = focusedId ? engine.graph.nodes.find(n => n.id === focusedId) : undefined
 
   const handleStatsChange = useCallback((newStats: SimulationStats, newPackets: Packet[]) => {
@@ -38,7 +40,11 @@ export default function App() {
     setPackets(newPackets)
   }, [])
 
-  const handleFocus = useCallback((id: string | null) => setFocusedId(id), [])
+  // Clicking a city always drops into the single-city view.
+  const handleFocus = useCallback((id: string | null) => {
+    setFocusedId(id)
+    if (id) setViewMode('city')
+  }, [])
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -88,6 +94,7 @@ export default function App() {
           engine={engine}
           onStatsChange={handleStatsChange}
           focusedId={focusedId}
+          viewMode={viewMode}
           onFocus={handleFocus}
         />
       </Canvas>
@@ -97,15 +104,40 @@ export default function App() {
       <Legend />
       <Controls />
 
-      {/* Focused-city banner */}
+      {/* Focused city / continent toolbar */}
       {focusedNode ? (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-slate-950/75 backdrop-blur-md border border-white/10 rounded-xl px-4 py-2.5 shadow-2xl">
-          <div className="text-center">
-            <div className="text-sm font-semibold text-white tracking-wide">{focusedNode.continent}</div>
-            <div className="text-[11px] text-teal-300/80">
-              from {focusedNode.label}
-            </div>
+          <div className="text-center min-w-[7rem]">
+            {viewMode === 'city' ? (
+              <>
+                <div className="text-sm font-semibold text-white tracking-wide">{focusedNode.label}</div>
+                <div className="text-[11px] text-teal-300/80 font-mono">
+                  {focusedNode.ip}
+                  {focusedNode.subLabel ? ` · ${focusedNode.subLabel}` : ''}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-sm font-semibold text-white tracking-wide">{focusedNode.continent}</div>
+                <div className="text-[11px] text-teal-300/80">from {focusedNode.label}</div>
+              </>
+            )}
           </div>
+          {viewMode === 'city' ? (
+            <button
+              onClick={() => setViewMode('continent')}
+              className="text-xs text-teal-200 hover:text-white bg-teal-400/15 hover:bg-teal-400/25 border border-teal-300/25 rounded-lg px-2.5 py-1 transition-colors"
+            >
+              View continent
+            </button>
+          ) : (
+            <button
+              onClick={() => setViewMode('city')}
+              className="text-xs text-teal-200 hover:text-white bg-teal-400/15 hover:bg-teal-400/25 border border-teal-300/25 rounded-lg px-2.5 py-1 transition-colors"
+            >
+              View city
+            </button>
+          )}
           <button
             onClick={() => setFocusedId(null)}
             className="text-xs text-slate-300 hover:text-white bg-white/10 hover:bg-white/20 border border-white/15 rounded-lg px-2.5 py-1 transition-colors"
