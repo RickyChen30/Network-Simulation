@@ -200,6 +200,8 @@ export class SimulationEngine {
       segment: retx ? 'RETX' : step.segment,
       sourceId: path[0],
       destinationId: path[path.length - 1],
+      srcPort: flow.srcPort,
+      dstPort: flow.dstPort,
       path,
       links: this.graph.links,
       simulationTimeMs: now,

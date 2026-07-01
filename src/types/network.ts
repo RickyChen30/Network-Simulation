@@ -73,6 +73,8 @@ export interface Packet {
   control: boolean // true for handshake/ack/teardown (vs payload data)
   sourceId: string
   destinationId: string
+  srcPort: number
+  dstPort: number
   // Ordered list of node IDs the packet will traverse
   path: string[]
   // How long (real seconds) each path segment takes — derived from link latency.

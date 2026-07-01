@@ -6,6 +6,7 @@ import { NetworkScene } from './rendering/NetworkScene'
 import { Dashboard } from './ui/Dashboard'
 import { Controls } from './ui/Controls'
 import { Legend } from './ui/Legend'
+import { PacketInspector } from './ui/PacketInspector'
 import { CAMERA_POSITION } from './config/constants'
 
 const DEFAULT_STATS: SimulationStats = {
@@ -25,9 +26,8 @@ export default function App() {
   const engine = useMemo(() => new SimulationEngine(), [])
 
   const [stats, setStats] = useState<SimulationStats>(DEFAULT_STATS)
-  // Packet array is tracked only for React key reconciliation; positions are
-  // updated imperatively in PacketMesh, bypassing React state for performance.
-  const [, setPackets] = useState<Packet[]>([])
+  // Live packet list (updated each frame) — used to drive the packet inspector.
+  const [packets, setPackets] = useState<Packet[]>([])
 
   // Which city the camera has flown into (null = whole-globe view), and whether
   // we're viewing just that city or its whole continent.
@@ -35,9 +35,24 @@ export default function App() {
   const [viewMode, setViewMode] = useState<'city' | 'continent'>('city')
   const focusedNode = focusedId ? engine.graph.nodes.find(n => n.id === focusedId) : undefined
 
+  // The flow the camera is currently riding along (a selected packet).
+  const [selectedFlowId, setSelectedFlowId] = useState<string | null>(null)
+  const nodeMap = useMemo(() => new Map(engine.graph.nodes.map(n => [n.id, n])), [engine])
+  const selectedPacket = useMemo(() => {
+    if (!selectedFlowId) return undefined
+    return (
+      packets.find(p => p.flowId === selectedFlowId && p.status === 'in-flight') ??
+      packets.find(p => p.flowId === selectedFlowId)
+    )
+  }, [packets, selectedFlowId])
+
   const handleStatsChange = useCallback((newStats: SimulationStats, newPackets: Packet[]) => {
     setStats(newStats)
     setPackets(newPackets)
+  }, [])
+
+  const handleSelectPacket = useCallback((p: Packet | null) => {
+    setSelectedFlowId(p ? p.flowId : null)
   }, [])
 
   // Clicking a city always drops into the single-city view.
@@ -71,7 +86,12 @@ export default function App() {
           engine.toggleFirewall()
           break
         case 'Escape':
-          setFocusedId(null)
+          // Deselect a followed packet first, otherwise leave the focus view.
+          setSelectedFlowId(prev => {
+            if (prev) return null
+            setFocusedId(null)
+            return prev
+          })
           break
       }
     }
@@ -96,6 +116,8 @@ export default function App() {
           focusedId={focusedId}
           viewMode={viewMode}
           onFocus={handleFocus}
+          selectedFlowId={selectedFlowId}
+          onSelectPacket={handleSelectPacket}
         />
       </Canvas>
 
@@ -103,6 +125,15 @@ export default function App() {
       <Dashboard stats={stats} />
       <Legend />
       <Controls />
+
+      {/* Packet inspector — shown while riding along a selected packet */}
+      {selectedPacket && (
+        <PacketInspector
+          packet={selectedPacket}
+          nodeMap={nodeMap}
+          onClose={() => setSelectedFlowId(null)}
+        />
+      )}
 
       {/* Focused city / continent toolbar */}
       {focusedNode ? (
@@ -147,7 +178,7 @@ export default function App() {
         </div>
       ) : (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 text-[11px] text-slate-500 tracking-wide pointer-events-none select-none">
-          Click a city to zoom in
+          Click a city to zoom in · click a packet to ride along
         </div>
       )}
 

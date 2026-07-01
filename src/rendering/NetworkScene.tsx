@@ -5,7 +5,8 @@ import { EffectComposer, Bloom, Vignette } from '@react-three/postprocessing'
 import * as THREE from 'three'
 import type { Packet, SimulationStats, NetworkNode } from '../types/network'
 import { SimulationEngine } from '../engine/simulation'
-import { angularDistance, GLOBE_RADIUS } from '../config/globe'
+import { angularDistance, GLOBE_RADIUS, arcPoint } from '../config/globe'
+import { getPacketWorldPosition } from '../engine/packet'
 import { NodeMesh } from './NodeMesh'
 import { LinkMesh } from './LinkMesh'
 import { PacketMesh } from './PacketMesh'
@@ -19,6 +20,8 @@ interface NetworkSceneProps {
   focusedId: string | null
   viewMode: 'city' | 'continent'
   onFocus: (id: string | null) => void
+  selectedFlowId: string | null
+  onSelectPacket: (packet: Packet | null) => void
 }
 
 // Reusable scratch vector (avoid per-frame allocation).
@@ -65,7 +68,15 @@ function dedupeMarkers(nodes: NetworkNode[]): NetworkNode[] {
 // Root of the 3D world: the globe, the network laid over it, the camera fly-to,
 // and post-processing. The engine tick runs here via useFrame so simulation and
 // render stay in sync.
-export function NetworkScene({ engine, onStatsChange, focusedId, viewMode, onFocus }: NetworkSceneProps) {
+export function NetworkScene({
+  engine,
+  onStatsChange,
+  focusedId,
+  viewMode,
+  onFocus,
+  selectedFlowId,
+  onSelectPacket,
+}: NetworkSceneProps) {
   const clockRef = useRef(new THREE.Clock())
   const realTimeRef = useRef(0)
 
@@ -78,6 +89,11 @@ export function NetworkScene({ engine, onStatsChange, focusedId, viewMode, onFoc
   // Direction of the last clicked city, so ESC returns to a world view centered
   // on it rather than always snapping back to the default (Americas) view.
   const returnDirRef = useRef<THREE.Vector3 | null>(null)
+  // Whether the ride-along (follow a packet) camera is currently driving.
+  const followActiveRef = useRef(false)
+  const followLastSeenRef = useRef(0)
+  const followPosRef = useRef(new THREE.Vector3())
+  const followAheadRef = useRef(new THREE.Vector3())
 
   useEffect(() => {
     engine.onStateChange = onStatsChange
@@ -150,6 +166,61 @@ export function NetworkScene({ engine, onStatsChange, focusedId, viewMode, onFoc
 
     const controls = controlsRef.current
     if (!controls) return
+
+    // --- Ride along a selected packet's flow ---
+    if (selectedFlowId) {
+      const pkt = engine.packets.find(p => p.flowId === selectedFlowId && p.status === 'in-flight')
+      if (pkt) {
+        controls.enabled = false
+        controls.autoRotate = false
+        followActiveRef.current = true
+        followLastSeenRef.current = realTimeRef.current
+        animatingRef.current = false
+
+        const p0 = getPacketWorldPosition(pkt, positionCache)
+        const fromId = pkt.path[pkt.pathIndex]
+        const toId = pkt.path[pkt.pathIndex + 1]
+        const from = positionCache.get(fromId) ?? p0
+        const to = positionCache.get(toId) ?? p0
+        const p1 = arcPoint(from, to, Math.min(1, pkt.progress + 0.06))
+
+        followPosRef.current.set(...p0)
+        followAheadRef.current.set(...p1)
+        const outward = followPosRef.current.clone().normalize()
+        const dir = followAheadRef.current.clone().sub(followPosRef.current)
+        if (dir.lengthSq() < 1e-6) dir.copy(outward)
+        dir.normalize()
+
+        // Chase cam: slightly behind and above the packet, looking ahead.
+        const camPos = followPosRef.current
+          .clone()
+          .addScaledVector(dir, -1.3)
+          .addScaledVector(outward, 1.0)
+        camera.position.lerp(camPos, 0.18)
+        camera.lookAt(followAheadRef.current)
+        return
+      }
+      // No in-flight packet right now. TCP is stop-and-wait, so hold through the
+      // brief gaps between segments; only release once the flow is truly done.
+      if (followActiveRef.current && realTimeRef.current - followLastSeenRef.current < 2500) {
+        return
+      }
+      if (followActiveRef.current) {
+        followActiveRef.current = false
+        controls.enabled = true
+        controls.target.set(0, 0, 0)
+        controls.update()
+        onSelectPacket(null)
+      }
+      return
+    }
+    if (followActiveRef.current) {
+      // Deselected by the user — hand control back.
+      followActiveRef.current = false
+      controls.enabled = true
+      controls.target.set(0, 0, 0)
+      controls.update()
+    }
 
     // Begin a fly whenever the focus target or view mode changes.
     const key = focusedId ? `${focusedId}:${viewMode}` : null
@@ -253,7 +324,13 @@ export function NetworkScene({ engine, onStatsChange, focusedId, viewMode, onFoc
         ))}
 
       {packets.map(packet => (
-        <PacketMesh key={packet.id} packet={packet} positionCache={positionCache} />
+        <PacketMesh
+          key={packet.id}
+          packet={packet}
+          positionCache={positionCache}
+          selected={packet.flowId === selectedFlowId}
+          onSelect={onSelectPacket}
+        />
       ))}
 
       {/* Post-processing: bloom + vignette */}

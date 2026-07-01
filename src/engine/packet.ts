@@ -51,6 +51,8 @@ export interface CreatePacketArgs {
   segment: Segment
   sourceId: string
   destinationId: string
+  srcPort: number
+  dstPort: number
   path: string[]
   links: NetworkLink[]
   simulationTimeMs: number
@@ -69,6 +71,8 @@ export function createPacket(args: CreatePacketArgs): Packet {
     control,
     sourceId: args.sourceId,
     destinationId: args.destinationId,
+    srcPort: args.srcPort,
+    dstPort: args.dstPort,
     path: args.path,
     segmentDurations: computeSegmentDurations(args.path, args.links),
     pathIndex: 0,
