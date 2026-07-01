@@ -231,6 +231,7 @@ export class SimulationEngine {
       path,
       links: this.graph.links,
       simulationTimeMs: now,
+      lossProb: flow.lossProb,
       lossAt,
     })
     this.packets.push(packet)

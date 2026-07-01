@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react'
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { Canvas } from '@react-three/fiber'
 import type { Packet, SimulationStats } from './types/network'
 import { SimulationEngine } from './engine/simulation'
@@ -38,12 +38,19 @@ export default function App() {
   // The flow the camera is currently riding along (a selected packet).
   const [selectedFlowId, setSelectedFlowId] = useState<string | null>(null)
   const nodeMap = useMemo(() => new Map(engine.graph.nodes.map(n => [n.id, n])), [engine])
+  // Keep showing the last packet of the flow through brief inter-segment gaps,
+  // so the inspector stays mounted (no flicker / collapse reset) while riding.
+  const lastPacketRef = useRef<Packet | undefined>(undefined)
   const selectedPacket = useMemo(() => {
-    if (!selectedFlowId) return undefined
-    return (
-      packets.find(p => p.flowId === selectedFlowId && p.status === 'in-flight') ??
-      packets.find(p => p.flowId === selectedFlowId)
-    )
+    if (!selectedFlowId) {
+      lastPacketRef.current = undefined
+      return undefined
+    }
+    const p =
+      packets.find(pk => pk.flowId === selectedFlowId && pk.status === 'in-flight') ??
+      packets.find(pk => pk.flowId === selectedFlowId)
+    if (p) lastPacketRef.current = p
+    return p ?? lastPacketRef.current
   }, [packets, selectedFlowId])
 
   const handleStatsChange = useCallback((newStats: SimulationStats, newPackets: Packet[]) => {
@@ -123,7 +130,7 @@ export default function App() {
 
       {/* HUD overlays */}
       <Dashboard stats={stats} />
-      <Legend />
+      {!selectedPacket && <Legend />}
       <Controls />
 
       {/* Packet inspector — shown while riding along a selected packet */}

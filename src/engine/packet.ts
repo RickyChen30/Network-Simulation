@@ -14,36 +14,43 @@ function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v))
 }
 
-// Look up the latency of the link connecting two adjacent path nodes.
-function linkLatency(a: string, b: string, links: NetworkLink[]): number {
-  const link = links.find(
-    l =>
-      (l.sourceId === a && l.targetId === b) ||
-      (l.sourceId === b && l.targetId === a),
-  )
-  return link?.latency ?? 10
-}
-
-// Convert each hop's latency into a real-time travel duration so that
-// fast backbone links zip and slow last-mile links crawl.
-function computeSegmentDurations(path: string[], links: NetworkLink[]): number[] {
+// Per-hop metrics for a path: the animation duration, the simulated one-way
+// latency, and the bottleneck (minimum) bandwidth along it.
+function computePathMetrics(path: string[], links: NetworkLink[]) {
   const durations: number[] = []
+  const latencies: number[] = []
+  let bottleneckBw = Infinity
   for (let i = 0; i < path.length - 1; i++) {
-    const latency = linkLatency(path[i], path[i + 1], links)
-    const seconds = clamp(
-      SEGMENT_BASE_SECONDS + latency * SEGMENT_LATENCY_SCALE,
-      SEGMENT_MIN_SECONDS,
-      SEGMENT_MAX_SECONDS,
+    const link = links.find(
+      l =>
+        (l.sourceId === path[i] && l.targetId === path[i + 1]) ||
+        (l.sourceId === path[i + 1] && l.targetId === path[i]),
     )
-    durations.push(seconds)
+    const latency = link?.latency ?? 10
+    latencies.push(latency)
+    durations.push(
+      clamp(
+        SEGMENT_BASE_SECONDS + latency * SEGMENT_LATENCY_SCALE,
+        SEGMENT_MIN_SECONDS,
+        SEGMENT_MAX_SECONDS,
+      ),
+    )
+    bottleneckBw = Math.min(bottleneckBw, link?.bandwidth ?? 100)
   }
-  return durations
+  return { durations, latencies, bottleneckBw: Number.isFinite(bottleneckBw) ? bottleneckBw : 0 }
 }
 
 // Control segments (handshake / ack / teardown) carry no payload.
 const CONTROL_SEGMENTS = new Set<Segment>([
   'SYN', 'SYN-ACK', 'ACK', 'DATA-ACK', 'FIN', 'FIN-ACK',
 ])
+
+// Realistic packet sizes (bytes): control packets are tiny, data is MTU-ish.
+function packetSize(segment: Segment): number {
+  if (CONTROL_SEGMENTS.has(segment)) return 40 + Math.floor(Math.random() * 20) // 40–60 B
+  if (segment === 'ECHO' || segment === 'REPLY') return 64
+  return 512 + Math.floor(Math.random() * 988) // 512–1500 B payload
+}
 
 export interface CreatePacketArgs {
   flowId: string
@@ -56,12 +63,14 @@ export interface CreatePacketArgs {
   path: string[]
   links: NetworkLink[]
   simulationTimeMs: number
+  lossProb: number
   lossAt?: number | null
 }
 
 export function createPacket(args: CreatePacketArgs): Packet {
   _packetCounter++
   const control = CONTROL_SEGMENTS.has(args.segment)
+  const { durations, latencies, bottleneckBw } = computePathMetrics(args.path, args.links)
 
   return {
     id: `pkt-${_packetCounter}`,
@@ -74,13 +83,17 @@ export function createPacket(args: CreatePacketArgs): Packet {
     srcPort: args.srcPort,
     dstPort: args.dstPort,
     path: args.path,
-    segmentDurations: computeSegmentDurations(args.path, args.links),
+    segmentDurations: durations,
     pathIndex: 0,
     progress: 0,
     createdAt: args.simulationTimeMs,
     status: 'in-flight',
     lossAt: args.lossAt ?? null,
     color: PROTOCOL_COLORS[args.protocol],
+    size: packetSize(args.segment),
+    lossProb: args.lossProb,
+    hopLatencies: latencies,
+    bottleneckBw,
   }
 }
 

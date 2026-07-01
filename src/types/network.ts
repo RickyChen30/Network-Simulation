@@ -88,6 +88,11 @@ export interface Packet {
   // If set (0..1), the packet is "lost" and vanishes when progress passes this.
   lossAt: number | null
   color: string
+  // Extra realism / inspector fields:
+  size: number // bytes
+  lossProb: number // this flow's path loss probability (0..1)
+  hopLatencies: number[] // one-way ms for each hop (path[i] → path[i+1])
+  bottleneckBw: number // min link bandwidth along the path
 }
 
 export interface SimulationStats {

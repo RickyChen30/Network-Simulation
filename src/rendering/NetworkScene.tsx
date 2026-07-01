@@ -99,6 +99,23 @@ export function NetworkScene({
     engine.onStateChange = onStatsChange
   }, [engine, onStatsChange])
 
+  // TEMP debug hook to select a packet from automation.
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(window as any).__ride = () => {
+      let t = realTimeRef.current
+      for (let i = 0; i < 400 && !engine.packets.some(pk => pk.status === 'in-flight'); i++) {
+        t += 16
+        engine.tick(1 / 60, t)
+      }
+      realTimeRef.current = t
+      const p = engine.packets.find(pk => pk.status === 'in-flight' && pk.path.length > 4) ??
+        engine.packets.find(pk => pk.status === 'in-flight')
+      if (p) onSelectPacket(p)
+      return p ? `${p.protocol} ${p.segment}` : 'none'
+    }
+  }, [engine, onSelectPacket])
+
   const { nodes, links } = engine.graph
   const nodeMap = useMemo(() => new Map(nodes.map(n => [n.id, n])), [nodes])
   const focusedNode = focusedId ? nodeMap.get(focusedId) : undefined
