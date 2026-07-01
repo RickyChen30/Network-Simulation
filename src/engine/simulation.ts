@@ -34,15 +34,25 @@ interface Flow {
   retxCount: number
   rttRecorded: boolean
   lastEmit: number
+  lossProb: number // per-packet loss probability for this flow's path
   done: boolean
 }
 
 const FLOW_SPAWN_RATE = 1.3 // new flows per real second
 const MAX_FLOWS = 26
-const LOSS_PROB = 0.06 // chance any packet is lost in transit
 const TCP_TIMEOUT_MS = 1100 // retransmit timeout for an un-acked TCP segment
 const UDP_STAGGER_MS = 110 // gap between UDP datagrams
 const MAX_RETX = 4
+const DDOS_CONGESTION = 6 // loss multiplier while a link is being flooded
+
+// Realistic per-link packet-loss probability, driven by link quality: fiber
+// backbone and subsea cables are near-lossless; access / last-mile links lose a
+// little more. Crossing a whole path, these compound to a fraction of a percent.
+function linkLossRate(bandwidth: number): number {
+  if (bandwidth >= 400) return 0.0003 // backbone / subsea / data-center fiber (~0.03%)
+  if (bandwidth >= 200) return 0.0008 // regional backbone (~0.08%)
+  return 0.003 // last-mile / access links (~0.3%)
+}
 
 let _flowCounter = 0
 
@@ -187,13 +197,29 @@ export class SimulationEngine {
       retxCount: 0,
       rttRecorded: false,
       lastEmit: 0,
+      lossProb: this._pathLossProb(fwdPath),
       done: false,
     })
   }
 
+  // Compound per-link loss along a path into a single per-packet probability.
+  private _pathLossProb(path: string[]): number {
+    let survive = 1
+    for (let i = 0; i < path.length - 1; i++) {
+      const a = path[i]
+      const b = path[i + 1]
+      const link = this.graph.links.find(
+        l => (l.sourceId === a && l.targetId === b) || (l.sourceId === b && l.targetId === a),
+      )
+      if (link) survive *= 1 - linkLossRate(link.bandwidth)
+    }
+    return 1 - survive
+  }
+
   private _emit(flow: Flow, step: FlowStep, now: number, retx: boolean): void {
     const path = step.dir === 'fwd' ? flow.fwdPath : flow.revPath
-    const lossAt = Math.random() < LOSS_PROB ? 0.3 + Math.random() * 0.5 : null
+    const lossProb = flow.lossProb * (this._isDDoS ? DDOS_CONGESTION : 1)
+    const lossAt = Math.random() < lossProb ? 0.3 + Math.random() * 0.5 : null
     const packet = createPacket({
       flowId: flow.id,
       protocol: flow.protocol,
