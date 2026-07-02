@@ -11,7 +11,7 @@ const TIER_ORDER: NodeType[] = [
 
 export function Legend() {
   return (
-    <div className="absolute top-4 right-4 w-52 bg-slate-950/70 backdrop-blur-md border border-white/10 rounded-xl p-4 shadow-2xl pointer-events-none select-none">
+    <div className="bg-slate-950/70 backdrop-blur-md border border-white/10 rounded-xl p-4 shadow-2xl pointer-events-none select-none">
       <p className="text-[11px] text-slate-400 uppercase tracking-[0.2em] mb-3">Network Tiers</p>
       <div className="space-y-2">
         {TIER_ORDER.map(type => (

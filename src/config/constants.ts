@@ -23,6 +23,14 @@ export const SEGMENT_LATENCY_SCALE = 0.018
 export const SEGMENT_MIN_SECONDS = 0.14
 export const SEGMENT_MAX_SECONDS = 0.55
 
+// --- Router queues & bandwidth limits ---------------------------------------
+// Every directed link transmits one packet at a time; transmission takes
+// LINK_SERVICE_FACTOR / bandwidth seconds. So a 120-unit city uplink serializes
+// a packet every ~230ms while an 800-unit data-center link does one every ~35ms.
+export const LINK_SERVICE_FACTOR = 28
+// Packets a router will hold per output port before tail-dropping newcomers.
+export const ROUTER_QUEUE_CAPACITY = 8
+
 // --- Visual sizing per node type -------------------------------------------
 // Marker radius for the glowing pin sitting on the globe surface.
 export const NODE_SIZE: Record<NodeType, number> = {

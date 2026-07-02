@@ -36,6 +36,13 @@ let tcpTransferCompleted = false
 const flowPrevInfo = new Map<string, { cwnd: number; lossEvents: number }>()
 let sawWindowHalving = false
 let halvingValid = true
+// Router queues: packets must actually queue at busy ports, queued packets
+// must resume (FIFO drain) rather than getting stuck, and queued packets must
+// sit parked (progress 0) at a router they've reached.
+let sawQueued = false
+let queuedResumed = false
+let queuedShapeOk = true
+const queuedIds = new Set<string>()
 
 function run(seconds: number) {
   const frames = Math.round(seconds / dt)
@@ -56,6 +63,13 @@ function run(seconds: number) {
       if (p.status === 'delivered') {
         if (p.path[p.path.length - 1] === p.destinationId) deliveredAtDestination = true
         else hopForwardingOk = false
+      }
+      if (p.status === 'queued') {
+        sawQueued = true
+        queuedIds.add(p.id)
+        if (p.progress !== 0 || p.pathIndex + 2 !== p.path.length) queuedShapeOk = false
+      } else if (queuedIds.has(p.id) && (p.status === 'in-flight' || p.status === 'delivered')) {
+        queuedResumed = true
       }
       if (p.protocol === 'TCP' && p.seq !== undefined) {
         if (p.segment === 'DATA' || p.segment === 'RETX') {
@@ -83,7 +97,16 @@ function run(seconds: number) {
       const prev = flowPrevInfo.get(flowId)
       if (prev && info.lossEvents > prev.lossEvents) {
         sawWindowHalving = true
-        if (info.cwnd > prev.cwnd || info.state !== 'congestion-avoidance') halvingValid = false
+        // Multiplicative decrease: ssthresh = half the pre-loss window, and the
+        // window restarts there (ACKs landing the same frame may add ~+1/cwnd
+        // each, so allow a little growth on top).
+        const halvedTo = Math.max(1, Math.floor(prev.cwnd / 2))
+        if (
+          info.state !== 'congestion-avoidance' ||
+          info.ssthresh > halvedTo + 1 ||
+          info.cwnd > info.ssthresh + 2
+        )
+          halvingValid = false
       }
       flowPrevInfo.set(flowId, { cwnd: info.cwnd, lossEvents: info.lossEvents })
     }
@@ -149,13 +172,24 @@ console.log(
 
 // Flood the network (DDoS = 6× loss) to force TCP loss events, and confirm
 // windows respond by halving + retransmitting.
+// Long enough for the flood's slow-start windows to ramp up (several RTTs)
+// and genuinely saturate the victim's ports.
 engine.toggleDDoS()
-run(14)
+run(20)
 engine.toggleDDoS()
 const okLossResponse = sawWindowHalving && halvingValid
 console.log('\n--- DDoS flood (forced TCP loss) ---')
 console.log('retransmits :', last!.retransmits)
 console.log('halving     :', `seen ${sawWindowHalving}, valid ${halvingValid ? 'ok' : 'BAD'}`)
+
+// Router queues + bandwidth limits: ports must have queued packets somewhere
+// along the way, queued packets must resume and complete, and the flood must
+// have overflowed at least one queue (congestion tail drops).
+const okQueues = sawQueued && queuedResumed && queuedShapeOk && last!.queueDrops > 0
+console.log(
+  'queues      :',
+  `queued seen ${sawQueued}, resumed ${queuedResumed}, shape ${queuedShapeOk ? 'ok' : 'BAD'}, tail drops ${last!.queueDrops}`,
+)
 
 // Raise the firewall (block the data centers) and confirm new flows fail.
 const droppedBefore = last!.droppedPackets
@@ -179,9 +213,10 @@ console.log('dns resolution    :', okDns ? 'PASS' : 'FAIL')
 console.log('per-hop forwarding:', okForwarding ? 'PASS' : 'FAIL')
 console.log('tcp congestion    :', okTcpCongestion ? 'PASS' : 'FAIL')
 console.log('loss halves cwnd  :', okLossResponse ? 'PASS' : 'FAIL')
+console.log('router queues     :', okQueues ? 'PASS' : 'FAIL')
 console.log('firewall blocks   :', okFirewall ? 'PASS' : 'FAIL')
 console.log('reset clears state:', okReset ? 'PASS' : 'FAIL')
 
-if (!okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okFirewall || !okReset)
+if (!okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okQueues || !okFirewall || !okReset)
   process.exit(1)
 console.log('\nALL CHECKS PASSED')

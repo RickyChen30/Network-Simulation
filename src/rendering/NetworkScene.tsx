@@ -184,7 +184,11 @@ export function NetworkScene({
 
     // --- Ride along a selected packet's flow ---
     if (selectedFlowId) {
-      const pkt = engine.packets.find(p => p.flowId === selectedFlowId && p.status === 'in-flight')
+      // Queued packets count too — the chase cam holds at the router while the
+      // ridden packet waits in an output queue.
+      const pkt = engine.packets.find(
+        p => p.flowId === selectedFlowId && (p.status === 'in-flight' || p.status === 'queued'),
+      )
       if (pkt) {
         controls.enabled = false
         controls.autoRotate = false

@@ -14,6 +14,8 @@ const DEFAULT_STATS: SimulationStats = {
   connections: 0,
   completed: 0,
   droppedPackets: 0,
+  queuedPackets: 0,
+  queueDrops: 0,
   retransmits: 0,
   dnsLookups: 0,
   averageLatency: 0,
@@ -133,10 +135,15 @@ export default function App() {
         />
       </Canvas>
 
-      {/* HUD overlays */}
+      {/* HUD overlays — the right column stacks the legend and controls, and
+          yields the space to the packet inspector while riding along. */}
       <Dashboard stats={stats} />
-      {!selectedPacket && <Legend />}
-      <Controls />
+      {!selectedPacket && (
+        <div className="absolute top-4 right-4 w-52 flex flex-col gap-3">
+          <Legend />
+          <Controls />
+        </div>
+      )}
 
       {/* Packet inspector — shown while riding along a selected packet */}
       {selectedPacket && (

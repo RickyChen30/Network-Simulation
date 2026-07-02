@@ -9,7 +9,8 @@ import type {
 } from '../types/network'
 import { NetworkGraph } from './network'
 import { computePathLatency } from './routing'
-import { createPacket, resetPacketCounter, stepPacket } from './packet'
+import { createPacket, resetPacketCounter, stepPacket, type ForwardingContext } from './packet'
+import { LinkScheduler } from './queues'
 import { MAX_ACTIVE_PACKETS, PACKET_LINGER_MS, LATENCY_WINDOW } from '../config/constants'
 
 // --- Flow model ------------------------------------------------------------
@@ -81,7 +82,10 @@ const MAX_RETX = 4
 const TCP_INITIAL_CWND = 1 // segments — every connection starts probing from 1
 const TCP_INITIAL_SSTHRESH = 8 // segments — where slow start hands over to additive increase
 const TCP_DATA_STAGGER_MS = 90 // spacing within a window burst (so trains are visible)
-const DDOS_CONGESTION = 6 // loss multiplier while a link is being flooded
+// DDoS drops are not faked with a loss multiplier: the flood's packets
+// genuinely overflow the victim's router queues (see queues.ts), and those
+// tail drops are what TCP senders back off from.
+const DDOS_SPAWN_MULTIPLIER = 6
 // How long a resolved name stays in a city's DNS cache — flows from that city
 // to the same server within the TTL skip the lookup.
 const DNS_TTL_MS = 45_000
@@ -143,12 +147,17 @@ export class SimulationEngine {
   packets: Packet[]
 
   private _flows: Flow[]
+  private _scheduler: LinkScheduler
   private _isPaused: boolean
   private _routingMode: RoutingMode
   private _isDDoS: boolean
+  // The flood's victim: while DDoS is on, every new flow targets this server,
+  // so its uplink queues genuinely saturate and overflow.
+  private _ddosTargetId: string | null
 
   private _completed: number
   private _dropped: number
+  private _queueDrops: number
   private _retransmits: number
   private _dnsLookups: number
   private _recentRtts: number[]
@@ -163,11 +172,14 @@ export class SimulationEngine {
     this.graph = new NetworkGraph()
     this.packets = []
     this._flows = []
+    this._scheduler = new LinkScheduler(this.graph.links)
     this._isPaused = false
     this._routingMode = 'shortest-path'
     this._isDDoS = false
+    this._ddosTargetId = null
     this._completed = 0
     this._dropped = 0
+    this._queueDrops = 0
     this._retransmits = 0
     this._dnsLookups = 0
     this._recentRtts = []
@@ -181,6 +193,7 @@ export class SimulationEngine {
 
     this._spawnFlows(deltaSeconds, realTimeMs)
     this._processFlows(realTimeMs)
+    this._drainQueues(realTimeMs)
     this._stepPackets(deltaSeconds, realTimeMs)
     this._pruneLingeredPackets(realTimeMs)
     this._pruneFlows()
@@ -188,16 +201,24 @@ export class SimulationEngine {
     this.onStateChange?.(this._buildStats(), this.packets)
   }
 
+  // A packet parked in a router queue is still "alive" for flow bookkeeping.
+  private _isAlive(p: Packet): boolean {
+    return p.status === 'in-flight' || p.status === 'queued'
+  }
+
   private _hasInflight(flowId: string): boolean {
-    return this.packets.some(p => p.flowId === flowId && p.status === 'in-flight')
+    return this.packets.some(p => p.flowId === flowId && this._isAlive(p))
   }
 
   private _spawnFlows(deltaSeconds: number, now: number): void {
+    // A flood brings far more concurrent connections than normal traffic.
+    const maxFlows = this._isDDoS ? MAX_FLOWS * 2 : MAX_FLOWS
+    const maxAlive = this._isDDoS ? MAX_ACTIVE_PACKETS * 2 : MAX_ACTIVE_PACKETS
     const active = this._flows.filter(f => !f.done).length
-    if (active >= MAX_FLOWS) return
-    if (this.packets.filter(p => p.status === 'in-flight').length >= MAX_ACTIVE_PACKETS) return
+    if (active >= maxFlows) return
+    if (this.packets.filter(p => this._isAlive(p)).length >= maxAlive) return
 
-    const rate = this._isDDoS ? FLOW_SPAWN_RATE * 4 : FLOW_SPAWN_RATE
+    const rate = this._isDDoS ? FLOW_SPAWN_RATE * DDOS_SPAWN_MULTIPLIER : FLOW_SPAWN_RATE
     this._spawnAccumulator += rate * deltaSeconds
     while (this._spawnAccumulator >= 1) {
       this._spawnAccumulator -= 1
@@ -221,7 +242,11 @@ export class SimulationEngine {
     if (homes.length === 0 || servers.length === 0) return
 
     const srcId = homes[Math.floor(Math.random() * homes.length)]
-    const dstId = servers[Math.floor(Math.random() * servers.length)]
+    // A DDoS flood converges on one victim server; normal traffic spreads out.
+    const dstId =
+      this._isDDoS && this._ddosTargetId
+        ? this._ddosTargetId
+        : servers[Math.floor(Math.random() * servers.length)]
     // Planned route, traced through the routers' forwarding tables. The flow
     // keeps it only for estimates (loss probability, RTT); packets themselves
     // are forwarded hop by hop and never carry it.
@@ -312,8 +337,7 @@ export class SimulationEngine {
       ? (step.dir === 'fwd' ? flow.dnsPath! : flow.dnsRevPath!)
       : (step.dir === 'fwd' ? flow.fwdPath : flow.revPath)
     const baseLoss = dns ? flow.dnsLossProb : flow.lossProb
-    const lossProb = baseLoss * (this._isDDoS ? DDOS_CONGESTION : 1)
-    const lossAt = Math.random() < lossProb ? 0.3 + Math.random() * 0.5 : null
+    const lossAt = Math.random() < baseLoss ? 0.3 + Math.random() * 0.5 : null
 
     // The sending host makes only the first routing decision; every later hop
     // is chosen by the router the packet lands on. No route at the source
@@ -344,6 +368,18 @@ export class SimulationEngine {
     })
     this.packets.push(packet)
     if (step.wait) flow.awaitingPacketId = packet.id
+
+    // The sending host contends for its own uplink like everyone else: the
+    // packet may go straight out, sit in the local queue, or be tail-dropped.
+    const slot = this._scheduler.send(packet, path[0], firstHopId, now)
+    if (slot === 'queued') {
+      packet.status = 'queued'
+    } else if (slot === 'dropped') {
+      packet.status = 'dropped'
+      this._dropped++
+      this._queueDrops++
+      this._lingerTimers.set(packet.id, now + 200)
+    }
     return packet
   }
 
@@ -358,7 +394,7 @@ export class SimulationEngine {
     for (const [seq, seg] of tcp.inFlight) {
       if (now - seg.sentAt <= TCP_TIMEOUT_MS) continue
       const stillFlying = this.packets.some(
-        p => p.flowId === flow.id && p.seq === seq && p.status === 'in-flight',
+        p => p.flowId === flow.id && p.seq === seq && this._isAlive(p),
       )
       if (stillFlying) continue
 
@@ -386,12 +422,15 @@ export class SimulationEngine {
     if (flow.done) return
 
     // Slow start / congestion avoidance both cap outstanding data at cwnd.
-    // Sends are staggered slightly so a window burst reads as a packet train.
+    // Normal senders stagger their sends so a window burst reads as a packet
+    // train; a DDoS flood doesn't pace itself — full-window bursts are exactly
+    // what overflows the victim's router queues.
+    const stagger = this._isDDoS ? 0 : TCP_DATA_STAGGER_MS
     const window = Math.max(1, Math.floor(tcp.cwnd))
     if (
       tcp.nextSeq < tcp.totalSegments &&
       tcp.inFlight.size < window &&
-      now - tcp.lastDataSent >= TCP_DATA_STAGGER_MS
+      now - tcp.lastDataSent >= stagger
     ) {
       const seq = tcp.nextSeq
       tcp.nextSeq++
@@ -456,13 +495,28 @@ export class SimulationEngine {
     }
   }
 
+  // Put queued packets whose transmission slot arrived back in flight.
+  private _drainQueues(realTimeMs: number): void {
+    for (const packet of this._scheduler.drain(realTimeMs)) {
+      if (packet.status === 'queued') packet.status = 'in-flight'
+    }
+  }
+
   private _stepPackets(deltaSeconds: number, realTimeMs: number): void {
-    // Each router a packet reaches makes its own forwarding decision by
-    // looking the destination up in that node's forwarding table.
-    const lookup = (fromId: string, destId: string) => this.graph.getNextHop(fromId, destId)
+    // Each router a packet reaches makes its own forwarding decision (its
+    // forwarding table) and then contends for the output link's bandwidth
+    // (its output queue).
+    const ctx: ForwardingContext = {
+      nextHop: (fromId, destId) => this.graph.getNextHop(fromId, destId),
+      transmit: (packet, fromId, toId) => {
+        const slot = this._scheduler.send(packet, fromId, toId, realTimeMs)
+        if (slot === 'dropped') this._queueDrops++
+        return slot
+      },
+    }
     for (const packet of this.packets) {
       if (packet.status !== 'in-flight') continue
-      const result = stepPacket(packet, deltaSeconds, lookup, this.graph.links)
+      const result = stepPacket(packet, deltaSeconds, ctx, this.graph.links)
       if (result === 'delivered') {
         this._onDelivered(packet, realTimeMs)
         this._lingerTimers.set(packet.id, realTimeMs + PACKET_LINGER_MS)
@@ -523,7 +577,7 @@ export class SimulationEngine {
 
   private _pruneLingeredPackets(realTimeMs: number): void {
     this.packets = this.packets.filter(p => {
-      if (p.status === 'in-flight') return true
+      if (this._isAlive(p)) return true
       const removeAt = this._lingerTimers.get(p.id) ?? 0
       if (realTimeMs >= removeAt) {
         this._lingerTimers.delete(p.id)
@@ -541,8 +595,10 @@ export class SimulationEngine {
   private _buildStats(): SimulationStats {
     const protocolMix: Record<Protocol, number> = { TCP: 0, UDP: 0, ICMP: 0 }
     let active = 0
+    let queued = 0
     for (const p of this.packets) {
-      if (p.status !== 'in-flight') continue
+      if (p.status === 'queued') queued++
+      if (!this._isAlive(p)) continue
       active++
       protocolMix[p.protocol]++
     }
@@ -556,6 +612,8 @@ export class SimulationEngine {
       connections: this._flows.filter(f => !f.done).length,
       completed: this._completed,
       droppedPackets: this._dropped,
+      queuedPackets: queued,
+      queueDrops: this._queueDrops,
       retransmits: this._retransmits,
       dnsLookups: this._dnsLookups,
       averageLatency: Math.round(avg),
@@ -579,6 +637,11 @@ export class SimulationEngine {
 
   toggleDDoS(): void {
     this._isDDoS = !this._isDDoS
+    const servers = this.graph.getServerIds()
+    this._ddosTargetId =
+      this._isDDoS && servers.length > 0
+        ? servers[Math.floor(Math.random() * servers.length)]
+        : null
     this.onStateChange?.(this._buildStats(), this.packets)
   }
 
@@ -590,8 +653,10 @@ export class SimulationEngine {
     this.graph.reset()
     this.packets = []
     this._flows = []
+    this._scheduler.rebuild(this.graph.links)
     this._completed = 0
     this._dropped = 0
+    this._queueDrops = 0
     this._retransmits = 0
     this._dnsLookups = 0
     this._recentRtts = []
@@ -601,6 +666,7 @@ export class SimulationEngine {
     this._isPaused = false
     this._routingMode = 'shortest-path'
     this._isDDoS = false
+    this._ddosTargetId = null
     resetPacketCounter()
     this.onStateChange?.(this._buildStats(), this.packets)
   }

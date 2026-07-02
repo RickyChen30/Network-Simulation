@@ -22,7 +22,9 @@ export function PacketMesh({ packet, positionCache, selected, onSelect }: Packet
   const haloRef = useRef<THREE.Mesh>(null)
 
   useFrame(({ clock }) => {
-    if (!meshRef.current || packet.status !== 'in-flight') return
+    // Queued packets update too — they sit parked at the router (progress 0 on
+    // the pending link) until the queue drains.
+    if (!meshRef.current || (packet.status !== 'in-flight' && packet.status !== 'queued')) return
     const pos = getPacketWorldPosition(packet, positionCache)
     meshRef.current.position.set(...pos)
     if (selected && haloRef.current) {
@@ -30,9 +32,10 @@ export function PacketMesh({ packet, positionCache, selected, onSelect }: Packet
     }
   })
 
-  // Dropped packets flash red and fade; control segments are smaller than data.
+  // Dropped packets flash red and fade; queued ones dim while they wait in a
+  // router's queue; control segments are smaller than data.
   const dropped = packet.status === 'dropped'
-  const fading = packet.status === 'delivered' ? 0.3 : 1
+  const fading = packet.status === 'delivered' ? 0.3 : packet.status === 'queued' ? 0.5 : 1
   const color = dropped ? '#ef4444' : packet.color
   const radius = PACKET_RADIUS * (packet.control ? 0.7 : 1.1) * (selected ? 1.5 : 1)
 

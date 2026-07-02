@@ -109,9 +109,12 @@ export function PacketInspector({ packet, nodeMap, tcp, onClose }: PacketInspect
   const ttl = Math.max(1, 64 - packet.pathIndex)
   const atEnd = packet.pathIndex >= hops.length - 1
   const nextHop = atEnd ? '—' : label(hops[packet.pathIndex + 1])
-  const currentHop = atEnd
-    ? `Arrived at ${label(hops[hops.length - 1])}`
-    : `${label(hops[packet.pathIndex])} → ${label(hops[packet.pathIndex + 1])}`
+  const currentHop =
+    packet.status === 'queued'
+      ? `Queued at ${label(hops[packet.pathIndex])}`
+      : atEnd
+        ? `Arrived at ${label(hops[hops.length - 1])}`
+        : `${label(hops[packet.pathIndex])} → ${label(hops[packet.pathIndex + 1])}`
   // Per-hop forwarding: the route past the next hop hasn't been decided yet —
   // each router picks it from its forwarding table when the packet arrives.
   const routeKnown = hops[hops.length - 1] === packet.destinationId

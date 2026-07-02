@@ -38,7 +38,8 @@ export type Segment =
   | 'DNS-QUERY' // resolve the server's name before the flow starts (UDP :53)
   | 'DNS-RESPONSE' // the resolver's answer back to the city
 
-export type PacketStatus = 'in-flight' | 'delivered' | 'dropped'
+// 'queued' = parked in a router's output queue, waiting for the link to free up.
+export type PacketStatus = 'in-flight' | 'queued' | 'delivered' | 'dropped'
 
 export interface NetworkNode {
   id: string
@@ -128,6 +129,8 @@ export interface SimulationStats {
   connections: number      // open flows (TCP connections / UDP+ICMP exchanges)
   completed: number        // flows that finished successfully
   droppedPackets: number   // packets lost in transit (or with no route)
+  queuedPackets: number    // packets currently waiting in router queues
+  queueDrops: number       // packets tail-dropped by full router queues (congestion)
   retransmits: number      // TCP segments resent after loss
   dnsLookups: number       // name resolutions performed (cache misses)
   // Rolling average round-trip time (ms), measured SYN → SYN-ACK etc.

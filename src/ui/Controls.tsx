@@ -16,7 +16,7 @@ const BINDINGS: Binding[] = [
 
 export function Controls() {
   return (
-    <div className="absolute bottom-4 left-4 bg-slate-950/70 backdrop-blur-md border border-white/10 rounded-xl p-3.5 shadow-2xl pointer-events-none select-none">
+    <div className="bg-slate-950/70 backdrop-blur-md border border-white/10 rounded-xl p-3.5 shadow-2xl pointer-events-none select-none">
       <p className="text-[11px] text-slate-400 uppercase tracking-[0.2em] mb-2.5">Controls</p>
       <div className="space-y-1.5">
         {BINDINGS.map(({ key, label }) => (

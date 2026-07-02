@@ -111,19 +111,25 @@ export function resetPacketCounter(): void {
   _packetCounter = 0
 }
 
-// A router's routing decision: given where the packet is and where it is
-// headed, return the neighbor to forward to (null = destination unreachable).
-export type NextHopLookup = (fromId: string, destId: string) => string | null
+// What a router does with an arriving packet, supplied by the engine:
+// `nextHop` is the forwarding-table lookup (null = destination unreachable);
+// `transmit` asks the chosen output port for a slot — 'sent' proceeds now,
+// 'queued' parks the packet at the router, 'dropped' is a queue-overflow drop.
+export interface ForwardingContext {
+  nextHop: (fromId: string, destId: string) => string | null
+  transmit: (packet: Packet, fromId: string, toId: string) => 'sent' | 'queued' | 'dropped'
+}
 
 // Advance a packet by deltaSeconds of real time. Each time it reaches a node,
-// that router looks the destination up via `lookup` and forwards it — the
-// packet never knows its route in advance. Returns 'delivered' when it reaches
-// the destination, 'dropped' if it is lost in transit or a router has no route
-// for it, or null while still in flight.
+// that router looks the destination up, picks the next hop, and contends for
+// the output link — the packet never knows its route in advance. Returns
+// 'delivered' when it reaches the destination, 'dropped' if it is lost in
+// transit / routed into a black hole / tail-dropped by a full queue, or null
+// while still in flight (possibly parked in a router queue).
 export function stepPacket(
   packet: Packet,
   deltaSeconds: number,
-  lookup: NextHopLookup,
+  ctx: ForwardingContext,
   links: NetworkLink[],
 ): 'delivered' | 'dropped' | null {
   if (packet.status !== 'in-flight') return null
@@ -154,7 +160,7 @@ export function stepPacket(
       return 'delivered'
     }
 
-    const nextId = lookup(hereId, packet.destinationId)
+    const nextId = ctx.nextHop(hereId, packet.destinationId)
     if (nextId === null) {
       // This router has no route (e.g. the firewall came up mid-flight).
       packet.status = 'dropped'
@@ -162,6 +168,22 @@ export function stepPacket(
       return 'dropped'
     }
     takeHop(packet, nextId, links)
+
+    // Contend for the output link's bandwidth.
+    const slot = ctx.transmit(packet, hereId, nextId)
+    if (slot === 'dropped') {
+      // The router's output queue is full — congestion tail drop.
+      packet.status = 'dropped'
+      packet.progress = 0
+      return 'dropped'
+    }
+    if (slot === 'queued') {
+      // Parked at the router until the link frees up; the engine's queue
+      // drain flips it back to in-flight.
+      packet.status = 'queued'
+      packet.progress = 0
+      return null
+    }
   }
 
   return null
