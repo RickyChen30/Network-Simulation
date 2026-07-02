@@ -1,4 +1,4 @@
-# 3D Global Internet Packet Simulator
+# 3D Global Internet Simulator
 
 A real-time 3D visualization of how internet traffic flows around the **whole
 world**, rendered on an interactive globe. Real cities, internet exchange points,
