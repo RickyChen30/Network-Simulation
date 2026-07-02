@@ -1,10 +1,12 @@
 import { useState } from 'react'
-import type { Packet, NetworkNode, Protocol } from '../types/network'
+import type { Packet, NetworkNode, Protocol, TcpCongestionInfo } from '../types/network'
 import { PROTOCOL_COLORS } from '../config/topology'
 
 interface PacketInspectorProps {
   packet: Packet
   nodeMap: Map<string, NetworkNode>
+  // Live congestion-control state of the ridden flow (TCP flows only).
+  tcp?: TcpCongestionInfo | null
   onClose: () => void
 }
 
@@ -54,9 +56,36 @@ function Row({ label, value, mono, color }: { label: string; value: React.ReactN
   )
 }
 
+// Visual bar for the congestion window: cwnd fill with a ssthresh tick mark.
+function CwndBar({ tcp }: { tcp: TcpCongestionInfo }) {
+  const scale = Math.max(tcp.ssthresh * 2, tcp.cwnd, 4)
+  const cwndPct = Math.min(100, (tcp.cwnd / scale) * 100)
+  const threshPct = Math.min(100, (tcp.ssthresh / scale) * 100)
+  const fill = tcp.state === 'slow-start' ? '#4ade80' : '#fbbf24'
+  return (
+    <div className="mt-1.5">
+      <div className="relative h-2 rounded bg-white/10 overflow-visible">
+        <div
+          className="absolute inset-y-0 left-0 rounded transition-all duration-300"
+          style={{ width: `${cwndPct}%`, backgroundColor: fill, boxShadow: `0 0 6px ${fill}88` }}
+        />
+        <div
+          className="absolute -top-0.5 -bottom-0.5 w-px bg-rose-300"
+          style={{ left: `${threshPct}%` }}
+          title={`ssthresh = ${tcp.ssthresh}`}
+        />
+      </div>
+      <div className="flex justify-between text-[9px] text-slate-500 mt-0.5">
+        <span>cwnd {tcp.cwnd.toFixed(1)}</span>
+        <span className="text-rose-300/80">ssthresh {tcp.ssthresh}</span>
+      </div>
+    </div>
+  )
+}
+
 // Deep inspector for a selected packet: identity, live performance, its route,
 // and a collapsible timeline of where it is along the path.
-export function PacketInspector({ packet, nodeMap, onClose }: PacketInspectorProps) {
+export function PacketInspector({ packet, nodeMap, tcp, onClose }: PacketInspectorProps) {
   const [timelineOpen, setTimelineOpen] = useState(true)
 
   const color = PROTOCOL_COLORS[packet.protocol]
@@ -121,6 +150,23 @@ export function PacketInspector({ packet, nodeMap, onClose }: PacketInspectorPro
         <Row label="Loss Prob." value={`${(packet.lossProb * 100).toFixed(2)}%`} mono color="#fda4af" />
         <Row label="Bandwidth" value={`${packet.bottleneckBw} Gbps`} mono />
       </Section>
+
+      {/* TCP congestion control — live sender state for the ridden flow */}
+      {tcp && (
+        <Section title="Congestion Control">
+          <Row
+            label="State"
+            value={tcp.state === 'slow-start' ? 'Slow start' : 'Congestion avoidance'}
+            color={tcp.state === 'slow-start' ? '#4ade80' : '#fbbf24'}
+          />
+          <Row label="Window (cwnd)" value={`${tcp.cwnd.toFixed(1)} seg`} mono color="#67e8f9" />
+          <Row label="Threshold" value={`${tcp.ssthresh} seg`} mono color="#fda4af" />
+          <Row label="In Flight" value={`${tcp.inFlightSegments} / ${Math.max(1, Math.floor(tcp.cwnd))} seg`} mono />
+          <Row label="Delivered" value={`${tcp.ackedSegments} / ${tcp.totalSegments} seg`} mono />
+          <Row label="Loss Events" value={tcp.lossEvents} mono color={tcp.lossEvents > 0 ? '#fda4af' : undefined} />
+          <CwndBar tcp={tcp} />
+        </Section>
+      )}
 
       {/* Connection */}
       <Section title="Connection">

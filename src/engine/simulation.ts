@@ -1,4 +1,12 @@
-import type { Packet, SimulationStats, RoutingMode, Protocol, Segment } from '../types/network'
+import type {
+  Packet,
+  SimulationStats,
+  RoutingMode,
+  Protocol,
+  Segment,
+  TcpCongestionState,
+  TcpCongestionInfo,
+} from '../types/network'
 import { NetworkGraph } from './network'
 import { computePathLatency } from './routing'
 import { createPacket, resetPacketCounter, stepPacket } from './packet'
@@ -14,9 +22,26 @@ interface FlowStep {
   segment: Segment
   dir: 'fwd' | 'ret'
   wait: boolean
-  // 'dns' steps ride the short city → resolver path as UDP port 53,
-  // regardless of the flow's own protocol.
-  phase?: 'dns'
+  // 'dns' steps ride the short city → resolver path as UDP port 53, regardless
+  // of the flow's own protocol. A 'transfer' step is a placeholder for TCP's
+  // whole data phase: instead of one packet, it runs the congestion-window
+  // machinery until every segment is acked, then the flow moves on to FIN.
+  phase?: 'dns' | 'transfer'
+}
+
+// Per-flow TCP congestion control (the sender's view of the data transfer).
+interface TcpTransfer {
+  cwnd: number // congestion window in segments; fractional during additive increase
+  ssthresh: number // slow-start threshold
+  state: TcpCongestionState
+  totalSegments: number // how many DATA segments this connection sends
+  nextSeq: number // next unsent sequence number
+  ackedCount: number
+  // Sent-but-unacked segments: seq → send bookkeeping for timeout/retransmit.
+  inFlight: Map<number, { sentAt: number; retx: number }>
+  lastDataSent: number
+  lastLossResponse: number // so one loss burst halves the window once, not per segment
+  lossEvents: number
 }
 
 interface Flow {
@@ -43,6 +68,7 @@ interface Flow {
   lastEmit: number
   lossProb: number // per-packet loss probability for this flow's path
   dnsLossProb: number // same, for the short DNS path
+  tcp: TcpTransfer | null // congestion-control state (TCP flows only)
   done: boolean
 }
 
@@ -51,6 +77,10 @@ const MAX_FLOWS = 26
 const TCP_TIMEOUT_MS = 1100 // retransmit timeout for an un-acked TCP segment
 const UDP_STAGGER_MS = 110 // gap between UDP datagrams
 const MAX_RETX = 4
+// --- TCP congestion control ---
+const TCP_INITIAL_CWND = 1 // segments — every connection starts probing from 1
+const TCP_INITIAL_SSTHRESH = 8 // segments — where slow start hands over to additive increase
+const TCP_DATA_STAGGER_MS = 90 // spacing within a window burst (so trains are visible)
 const DDOS_CONGESTION = 6 // loss multiplier while a link is being flooded
 // How long a resolved name stays in a city's DNS cache — flows from that city
 // to the same server within the TTL skip the lookup.
@@ -83,19 +113,16 @@ function destPort(protocol: Protocol): number {
 
 function buildSteps(protocol: Protocol): FlowStep[] {
   if (protocol === 'TCP') {
-    const steps: FlowStep[] = [
+    // Handshake, then the whole windowed data phase (driven by the congestion
+    // window, not by steps), then teardown.
+    return [
       { segment: 'SYN', dir: 'fwd', wait: true },
       { segment: 'SYN-ACK', dir: 'ret', wait: true },
       { segment: 'ACK', dir: 'fwd', wait: true },
+      { segment: 'DATA', dir: 'fwd', wait: false, phase: 'transfer' },
+      { segment: 'FIN', dir: 'fwd', wait: true },
+      { segment: 'FIN-ACK', dir: 'ret', wait: true },
     ]
-    const dataCount = 2 + Math.floor(Math.random() * 4)
-    for (let i = 0; i < dataCount; i++) {
-      steps.push({ segment: 'DATA', dir: 'fwd', wait: true })
-      steps.push({ segment: 'DATA-ACK', dir: 'ret', wait: true })
-    }
-    steps.push({ segment: 'FIN', dir: 'fwd', wait: true })
-    steps.push({ segment: 'FIN-ACK', dir: 'ret', wait: true })
-    return steps
   }
   if (protocol === 'UDP') {
     const n = 3 + Math.floor(Math.random() * 6)
@@ -246,6 +273,21 @@ export class SimulationEngine {
       lastEmit: 0,
       lossProb: this._pathLossProb(fwdPath),
       dnsLossProb: dnsPath ? this._pathLossProb(dnsPath) : 0,
+      tcp:
+        protocol === 'TCP'
+          ? {
+              cwnd: TCP_INITIAL_CWND,
+              ssthresh: TCP_INITIAL_SSTHRESH,
+              state: 'slow-start',
+              totalSegments: 10 + Math.floor(Math.random() * 7), // 10–16
+              nextSeq: 0,
+              ackedCount: 0,
+              inFlight: new Map(),
+              lastDataSent: 0,
+              lastLossResponse: 0,
+              lossEvents: 0,
+            }
+          : null,
       done: false,
     })
   }
@@ -264,7 +306,7 @@ export class SimulationEngine {
     return 1 - survive
   }
 
-  private _emit(flow: Flow, step: FlowStep, now: number, retx: boolean): void {
+  private _emit(flow: Flow, step: FlowStep, now: number, retx: boolean, seq?: number): Packet | null {
     const dns = step.phase === 'dns'
     const path = dns
       ? (step.dir === 'fwd' ? flow.dnsPath! : flow.dnsRevPath!)
@@ -281,7 +323,7 @@ export class SimulationEngine {
     const firstHopId = this.graph.getNextHop(path[0], destinationId)
     if (firstHopId === null) {
       this._dropped++
-      return
+      return null
     }
 
     const packet = createPacket({
@@ -298,9 +340,65 @@ export class SimulationEngine {
       simulationTimeMs: now,
       lossProb: baseLoss,
       lossAt,
+      seq,
     })
     this.packets.push(packet)
     if (step.wait) flow.awaitingPacketId = packet.id
+    return packet
+  }
+
+  // One tick of TCP's congestion-controlled data phase for a flow: retransmit
+  // timed-out segments (halving the window — multiplicative decrease), then
+  // send new segments while the window has room.
+  private _tickTransfer(flow: Flow, now: number): void {
+    const tcp = flow.tcp!
+
+    // Loss detection: an unacked segment past the timeout whose packets (the
+    // DATA or its returning ACK) are no longer in flight was lost somewhere.
+    for (const [seq, seg] of tcp.inFlight) {
+      if (now - seg.sentAt <= TCP_TIMEOUT_MS) continue
+      const stillFlying = this.packets.some(
+        p => p.flowId === flow.id && p.seq === seq && p.status === 'in-flight',
+      )
+      if (stillFlying) continue
+
+      if (seg.retx >= MAX_RETX) {
+        flow.done = true // too many losses on one segment: connection reset
+        return
+      }
+
+      // Congestion response — once per loss burst, not per lost segment:
+      // ssthresh drops to half the window, and the window restarts there.
+      if (now - tcp.lastLossResponse > TCP_TIMEOUT_MS) {
+        tcp.ssthresh = Math.max(1, Math.floor(tcp.cwnd / 2))
+        tcp.cwnd = tcp.ssthresh
+        tcp.state = 'congestion-avoidance'
+        tcp.lossEvents++
+        tcp.lastLossResponse = now
+      }
+
+      this._retransmits++
+      seg.retx++
+      seg.sentAt = now
+      this._emit(flow, { segment: 'DATA', dir: 'fwd', wait: false }, now, true, seq)
+      break // at most one retransmission per tick
+    }
+    if (flow.done) return
+
+    // Slow start / congestion avoidance both cap outstanding data at cwnd.
+    // Sends are staggered slightly so a window burst reads as a packet train.
+    const window = Math.max(1, Math.floor(tcp.cwnd))
+    if (
+      tcp.nextSeq < tcp.totalSegments &&
+      tcp.inFlight.size < window &&
+      now - tcp.lastDataSent >= TCP_DATA_STAGGER_MS
+    ) {
+      const seq = tcp.nextSeq
+      tcp.nextSeq++
+      tcp.lastDataSent = now
+      tcp.inFlight.set(seq, { sentAt: now, retx: 0 })
+      this._emit(flow, { segment: 'DATA', dir: 'fwd', wait: false }, now, false, seq)
+    }
   }
 
   private _processFlows(now: number): void {
@@ -332,6 +430,19 @@ export class SimulationEngine {
       }
 
       const step = flow.steps[flow.stepIndex]
+
+      // TCP data phase: run the congestion window instead of emitting one
+      // packet, and only advance to teardown once every segment is acked.
+      if (step.phase === 'transfer') {
+        if (!flow.tcp) {
+          flow.stepIndex++
+          continue
+        }
+        this._tickTransfer(flow, now)
+        if (flow.tcp.ackedCount >= flow.tcp.totalSegments) flow.stepIndex++
+        continue
+      }
+
       if (!step.wait && now - flow.lastEmit < UDP_STAGGER_MS) continue
 
       this._emit(flow, step, now, false)
@@ -365,6 +476,27 @@ export class SimulationEngine {
   private _onDelivered(packet: Packet, now: number): void {
     const flow = this._flows.find(f => f.id === packet.flowId)
     if (!flow) return
+
+    // TCP data transfer (packets carrying a sequence number):
+    if (flow.tcp && packet.seq !== undefined) {
+      if (packet.destinationId === flow.dstId) {
+        // Receiver: every DATA (or retransmitted) segment that arrives is acked.
+        this._emit(flow, { segment: 'DATA-ACK', dir: 'ret', wait: false }, now, false, packet.seq)
+      } else if (packet.segment === 'DATA-ACK') {
+        // Sender: a new ACK opens the congestion window. Duplicate ACKs from
+        // spurious retransmissions are ignored (seq no longer outstanding).
+        const tcp = flow.tcp
+        if (tcp.inFlight.delete(packet.seq)) {
+          tcp.ackedCount++
+          if (tcp.state === 'slow-start') {
+            tcp.cwnd += 1 // +1 per ACK ⇒ the window doubles every RTT
+            if (tcp.cwnd >= tcp.ssthresh) tcp.state = 'congestion-avoidance'
+          } else {
+            tcp.cwnd += 1 / tcp.cwnd // additive increase: ~+1 per RTT
+          }
+        }
+      }
+    }
 
     // Record RTT when the first reply of the exchange comes back.
     if (!flow.rttRecorded && (packet.segment === 'SYN-ACK' || packet.segment === 'REPLY')) {
@@ -471,6 +603,22 @@ export class SimulationEngine {
     this._isDDoS = false
     resetPacketCounter()
     this.onStateChange?.(this._buildStats(), this.packets)
+  }
+
+  // Live congestion-control snapshot for the packet inspector (null for
+  // non-TCP flows or flows that have been pruned).
+  getTcpInfo(flowId: string): TcpCongestionInfo | null {
+    const tcp = this._flows.find(f => f.id === flowId)?.tcp
+    if (!tcp) return null
+    return {
+      cwnd: tcp.cwnd,
+      ssthresh: tcp.ssthresh,
+      state: tcp.state,
+      inFlightSegments: tcp.inFlight.size,
+      ackedSegments: tcp.ackedCount,
+      totalSegments: tcp.totalSegments,
+      lossEvents: tcp.lossEvents,
+    }
   }
 
   getPositionCache(): Map<string, [number, number, number]> {

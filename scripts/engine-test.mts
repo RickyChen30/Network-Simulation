@@ -22,6 +22,20 @@ let dnsPacketShapeOk = true
 let hopForwardingOk = true
 let sawMultiHopInFlight = false
 let deliveredAtDestination = false
+// TCP congestion control: cwnd must start at 1, grow (slow start doubles per
+// RTT), respect ssthresh, and DATA/DATA-ACK must carry matching seq numbers.
+const tcpFirstCwnd = new Map<string, number>()
+let tcpMaxCwnd = 0
+let sawCongestionAvoidance = false
+let cwndWithinBoundsOk = true
+const dataSeqs = new Map<string, Set<number>>() // flowId → seqs seen on DATA
+let ackSeqMatchedData = false
+let tcpTransferCompleted = false
+// Loss response: when a flow's lossEvents ticks up, its window must not have
+// grown and it must be in congestion avoidance (multiplicative decrease).
+const flowPrevInfo = new Map<string, { cwnd: number; lossEvents: number }>()
+let sawWindowHalving = false
+let halvingValid = true
 
 function run(seconds: number) {
   const frames = Math.round(seconds / dt)
@@ -43,11 +57,43 @@ function run(seconds: number) {
         if (p.path[p.path.length - 1] === p.destinationId) deliveredAtDestination = true
         else hopForwardingOk = false
       }
+      if (p.protocol === 'TCP' && p.seq !== undefined) {
+        if (p.segment === 'DATA' || p.segment === 'RETX') {
+          if (!dataSeqs.has(p.flowId)) dataSeqs.set(p.flowId, new Set())
+          dataSeqs.get(p.flowId)!.add(p.seq)
+        } else if (p.segment === 'DATA-ACK' && dataSeqs.get(p.flowId)?.has(p.seq)) {
+          ackSeqMatchedData = true
+        }
+      }
+    }
+    // Sample congestion state of every live TCP flow (via the inspector API).
+    for (const flowId of new Set(engine.packets.filter(p => p.protocol === 'TCP').map(p => p.flowId))) {
+      const info = engine.getTcpInfo(flowId)
+      if (!info) continue
+      if (!tcpFirstCwnd.has(flowId)) tcpFirstCwnd.set(flowId, info.cwnd)
+      tcpMaxCwnd = Math.max(tcpMaxCwnd, info.cwnd)
+      if (info.state === 'congestion-avoidance') sawCongestionAvoidance = true
+      // Slow start must never push cwnd past ssthresh without switching state.
+      if (info.state === 'slow-start' && info.cwnd > info.ssthresh) cwndWithinBoundsOk = false
+      // Without losses, in-flight data never exceeds the window. (After a loss
+      // halves cwnd, already-outstanding segments may exceed it — that's TCP.)
+      if (info.lossEvents === 0 && info.inFlightSegments > Math.max(1, Math.floor(info.cwnd)))
+        cwndWithinBoundsOk = false
+      if (info.ackedSegments >= info.totalSegments) tcpTransferCompleted = true
+      const prev = flowPrevInfo.get(flowId)
+      if (prev && info.lossEvents > prev.lossEvents) {
+        sawWindowHalving = true
+        if (info.cwnd > prev.cwnd || info.state !== 'congestion-avoidance') halvingValid = false
+      }
+      flowPrevInfo.set(flowId, { cwnd: info.cwnd, lossEvents: info.lossEvents })
     }
   }
 }
 
-run(16)
+// Long enough for TCP slow start to double up to ssthresh AND for a whole
+// 10–16 segment transfer (~6 RTTs, and intercontinental RTTs run several
+// seconds of real time) to finish.
+run(30)
 console.log('--- Normal operation (protocol flows) ---')
 console.log('connections :', last!.connections)
 console.log('in flight   :', last!.activePackets)
@@ -88,6 +134,29 @@ for (const src of homes.slice(0, 5)) {
 const okForwarding = tablesOk && hopForwardingOk && sawMultiHopInFlight && deliveredAtDestination
 console.log('forwarding  :', `tables ${tablesOk ? 'ok' : 'BAD'}, hop-by-hop ${hopForwardingOk ? 'ok' : 'BAD'}, partial-route seen ${sawMultiHopInFlight}, delivery ${deliveredAtDestination}`)
 
+// TCP congestion control: every connection starts at cwnd=1, slow start grows
+// the window, some flow reaches congestion avoidance, in-flight never exceeds
+// the window, ACKs echo DATA seqs, and at least one transfer fully completes.
+const allStartAtOne = tcpFirstCwnd.size > 0 && [...tcpFirstCwnd.values()].every(c => c === 1)
+const okTcpCongestion =
+  allStartAtOne && tcpMaxCwnd >= 4 && sawCongestionAvoidance && cwndWithinBoundsOk && ackSeqMatchedData && tcpTransferCompleted
+console.log(
+  'tcp cwnd    :',
+  `flows ${tcpFirstCwnd.size}, all start@1 ${allStartAtOne}, max cwnd ${tcpMaxCwnd.toFixed(1)}, ` +
+    `CA reached ${sawCongestionAvoidance}, bounds ${cwndWithinBoundsOk ? 'ok' : 'BAD'}, ` +
+    `ack/seq match ${ackSeqMatchedData}, transfer done ${tcpTransferCompleted}`,
+)
+
+// Flood the network (DDoS = 6× loss) to force TCP loss events, and confirm
+// windows respond by halving + retransmitting.
+engine.toggleDDoS()
+run(14)
+engine.toggleDDoS()
+const okLossResponse = sawWindowHalving && halvingValid
+console.log('\n--- DDoS flood (forced TCP loss) ---')
+console.log('retransmits :', last!.retransmits)
+console.log('halving     :', `seen ${sawWindowHalving}, valid ${halvingValid ? 'ok' : 'BAD'}`)
+
 // Raise the firewall (block the data centers) and confirm new flows fail.
 const droppedBefore = last!.droppedPackets
 engine.toggleFirewall()
@@ -108,8 +177,11 @@ console.log('flows complete    :', okNormal ? 'PASS' : 'FAIL')
 console.log('tcp handshake seen:', sawHandshake || protocolsSeen >= 0 ? 'PASS' : 'FAIL')
 console.log('dns resolution    :', okDns ? 'PASS' : 'FAIL')
 console.log('per-hop forwarding:', okForwarding ? 'PASS' : 'FAIL')
+console.log('tcp congestion    :', okTcpCongestion ? 'PASS' : 'FAIL')
+console.log('loss halves cwnd  :', okLossResponse ? 'PASS' : 'FAIL')
 console.log('firewall blocks   :', okFirewall ? 'PASS' : 'FAIL')
 console.log('reset clears state:', okReset ? 'PASS' : 'FAIL')
 
-if (!okNormal || !okDns || !okForwarding || !okFirewall || !okReset) process.exit(1)
+if (!okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okFirewall || !okReset)
+  process.exit(1)
 console.log('\nALL CHECKS PASSED')

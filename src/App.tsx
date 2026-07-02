@@ -54,6 +54,10 @@ export default function App() {
     return p ?? lastPacketRef.current
   }, [packets, selectedFlowId])
 
+  // Live TCP congestion-control readout for the ridden flow. Re-read every
+  // frame (the packets state updates each tick, so this render re-runs).
+  const tcpInfo = selectedFlowId && selectedPacket ? engine.getTcpInfo(selectedFlowId) : null
+
   const handleStatsChange = useCallback((newStats: SimulationStats, newPackets: Packet[]) => {
     setStats(newStats)
     setPackets(newPackets)
@@ -139,6 +143,7 @@ export default function App() {
         <PacketInspector
           packet={selectedPacket}
           nodeMap={nodeMap}
+          tcp={tcpInfo}
           onClose={() => setSelectedFlowId(null)}
         />
       )}

@@ -102,6 +102,25 @@ export interface Packet {
   lossProb: number // this flow's path loss probability (0..1)
   hopLatencies: number[] // one-way ms for each hop taken (path[i] → path[i+1])
   bottleneckBw: number // min link bandwidth seen so far along the path
+  // TCP sequence number for DATA segments (and the ack number the matching
+  // DATA-ACK carries back). Undefined for non-data traffic.
+  seq?: number
+}
+
+// --- TCP congestion control --------------------------------------------------
+
+// Which congestion-control phase a TCP flow's sender is in.
+export type TcpCongestionState = 'slow-start' | 'congestion-avoidance'
+
+// Live snapshot of a TCP flow's congestion control, for the packet inspector.
+export interface TcpCongestionInfo {
+  cwnd: number // congestion window, in segments (fractional during additive increase)
+  ssthresh: number // slow-start threshold, in segments
+  state: TcpCongestionState
+  inFlightSegments: number // sent but not yet acked
+  ackedSegments: number
+  totalSegments: number
+  lossEvents: number // times the window was halved
 }
 
 export interface SimulationStats {

@@ -71,6 +71,7 @@ export interface CreatePacketArgs {
   simulationTimeMs: number
   lossProb: number
   lossAt?: number | null
+  seq?: number
 }
 
 export function createPacket(args: CreatePacketArgs): Packet {
@@ -100,6 +101,7 @@ export function createPacket(args: CreatePacketArgs): Packet {
     lossProb: args.lossProb,
     hopLatencies: [],
     bottleneckBw: Infinity,
+    seq: args.seq,
   }
   takeHop(packet, args.firstHopId, args.links)
   return packet
