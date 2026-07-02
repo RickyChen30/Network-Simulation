@@ -27,16 +27,14 @@ function buildAdjacency(
   return adj
 }
 
-// Returns the ordered list of node IDs forming the lowest-latency path,
-// or null if no path exists (e.g. firewall blocks all routes).
-export function findShortestPath(
+// Full single-source Dijkstra: returns cumulative latency and the predecessor
+// of every reachable node. `stopAt` allows an early exit for single-pair queries.
+function dijkstraFrom(
   sourceId: string,
-  destId: string,
   nodes: NetworkNode[],
-  links: NetworkLink[],
-): string[] | null {
-  const adj = buildAdjacency(nodes, links)
-
+  adj: Map<string, AdjacencyEntry[]>,
+  stopAt?: string,
+): { dist: Map<string, number>; prev: Map<string, string | null> } {
   // Distance map: nodeId → cumulative latency from source
   const dist = new Map<string, number>()
   const prev = new Map<string, string | null>()
@@ -54,7 +52,7 @@ export function findShortestPath(
     queue.sort((a, b) => a.cost - b.cost)
     const current = queue.shift()!
 
-    if (current.id === destId) break
+    if (current.id === stopAt) break
     if (current.cost > (dist.get(current.id) ?? Infinity)) continue
 
     for (const { neighborId, latency } of adj.get(current.id) ?? []) {
@@ -67,6 +65,20 @@ export function findShortestPath(
     }
   }
 
+  return { dist, prev }
+}
+
+// Returns the ordered list of node IDs forming the lowest-latency path,
+// or null if no path exists (e.g. firewall blocks all routes).
+export function findShortestPath(
+  sourceId: string,
+  destId: string,
+  nodes: NetworkNode[],
+  links: NetworkLink[],
+): string[] | null {
+  const adj = buildAdjacency(nodes, links)
+  const { dist, prev } = dijkstraFrom(sourceId, nodes, adj, destId)
+
   // Reconstruct path by walking prev pointers backward
   if (dist.get(destId) === Infinity) return null
 
@@ -78,6 +90,36 @@ export function findShortestPath(
   }
 
   return path
+}
+
+// A router's forwarding table: destination node ID → next-hop neighbor ID.
+export type ForwardingTable = Map<string, string>
+
+// Build every router's forwarding table (nodeId → its ForwardingTable), the way
+// a converged link-state protocol (OSPF/IS-IS) would: each router ends up
+// knowing, for every destination, only which neighbor to hand the packet to.
+//
+// One Dijkstra per *destination* fills in that column of every router's table:
+// links are symmetric, so on the shortest path source → D, a node's predecessor
+// in the tree rooted at D is exactly its next hop toward D.
+export function buildForwardingTables(
+  nodes: NetworkNode[],
+  links: NetworkLink[],
+): Map<string, ForwardingTable> {
+  const adj = buildAdjacency(nodes, links)
+  const tables = new Map<string, ForwardingTable>()
+  for (const node of nodes) tables.set(node.id, new Map())
+
+  for (const dest of nodes) {
+    const { dist, prev } = dijkstraFrom(dest.id, nodes, adj)
+    for (const node of nodes) {
+      if (node.id === dest.id) continue
+      if ((dist.get(node.id) ?? Infinity) === Infinity) continue
+      tables.get(node.id)!.set(dest.id, prev.get(node.id)!)
+    }
+  }
+
+  return tables
 }
 
 // Returns the total simulated latency (ms) for a given path

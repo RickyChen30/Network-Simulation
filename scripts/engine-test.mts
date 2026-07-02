@@ -16,6 +16,12 @@ let realMs = 0
 const seenSegments = new Set<string>()
 const flowFirstSegment = new Map<string, string>()
 let dnsPacketShapeOk = true
+// Per-hop forwarding: packets must never know the route past their next hop
+// (path holds pathIndex+2 entries while in flight), and a delivered packet's
+// traveled path must end at its destination.
+let hopForwardingOk = true
+let sawMultiHopInFlight = false
+let deliveredAtDestination = false
 
 function run(seconds: number) {
   const frames = Math.round(seconds / dt)
@@ -28,6 +34,14 @@ function run(seconds: number) {
       if (p.segment === 'DNS-QUERY' || p.segment === 'DNS-RESPONSE') {
         // DNS must be UDP to port 53 over the one-hop city ↔ resolver path.
         if (p.protocol !== 'UDP' || p.dstPort !== 53 || p.path.length !== 2) dnsPacketShapeOk = false
+      }
+      if (p.status === 'in-flight') {
+        if (p.path.length !== p.pathIndex + 2) hopForwardingOk = false
+        if (p.expectedHops >= 3 && p.path.length < p.expectedHops + 1) sawMultiHopInFlight = true
+      }
+      if (p.status === 'delivered') {
+        if (p.path[p.path.length - 1] === p.destinationId) deliveredAtDestination = true
+        else hopForwardingOk = false
       }
     }
   }
@@ -58,6 +72,22 @@ const dnsBeforeFlow = [...flowFirstSegment.values()].includes('DNS-QUERY')
 const okDns = last!.dnsLookups > 0 && sawDns && dnsBeforeFlow && dnsPacketShapeOk
 console.log('dns lookups :', last!.dnsLookups)
 
+// Per-hop forwarding: every router's table decision must agree with Dijkstra —
+// walking the tables from any home to any server reproduces a full route.
+const homes = engine.graph.getHomeIds()
+const servers = engine.graph.getServerIds()
+let tablesOk = true
+for (const src of homes.slice(0, 5)) {
+  for (const dst of servers.slice(0, 5)) {
+    const route = engine.graph.getRoute(src, dst)
+    if (!route || route[0] !== src || route[route.length - 1] !== dst) tablesOk = false
+    // The first hop must match a direct table lookup at the source.
+    if (route && engine.graph.getNextHop(src, dst) !== route[1]) tablesOk = false
+  }
+}
+const okForwarding = tablesOk && hopForwardingOk && sawMultiHopInFlight && deliveredAtDestination
+console.log('forwarding  :', `tables ${tablesOk ? 'ok' : 'BAD'}, hop-by-hop ${hopForwardingOk ? 'ok' : 'BAD'}, partial-route seen ${sawMultiHopInFlight}, delivery ${deliveredAtDestination}`)
+
 // Raise the firewall (block the data centers) and confirm new flows fail.
 const droppedBefore = last!.droppedPackets
 engine.toggleFirewall()
@@ -77,8 +107,9 @@ console.log('\n--- Results ---')
 console.log('flows complete    :', okNormal ? 'PASS' : 'FAIL')
 console.log('tcp handshake seen:', sawHandshake || protocolsSeen >= 0 ? 'PASS' : 'FAIL')
 console.log('dns resolution    :', okDns ? 'PASS' : 'FAIL')
+console.log('per-hop forwarding:', okForwarding ? 'PASS' : 'FAIL')
 console.log('firewall blocks   :', okFirewall ? 'PASS' : 'FAIL')
 console.log('reset clears state:', okReset ? 'PASS' : 'FAIL')
 
-if (!okNormal || !okDns || !okFirewall || !okReset) process.exit(1)
+if (!okNormal || !okDns || !okForwarding || !okFirewall || !okReset) process.exit(1)
 console.log('\nALL CHECKS PASSED')

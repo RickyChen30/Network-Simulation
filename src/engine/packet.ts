@@ -14,30 +14,30 @@ function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v))
 }
 
-// Per-hop metrics for a path: the animation duration, the simulated one-way
-// latency, and the bottleneck (minimum) bandwidth along it.
-function computePathMetrics(path: string[], links: NetworkLink[]) {
-  const durations: number[] = []
-  const latencies: number[] = []
-  let bottleneckBw = Infinity
-  for (let i = 0; i < path.length - 1; i++) {
-    const link = links.find(
-      l =>
-        (l.sourceId === path[i] && l.targetId === path[i + 1]) ||
-        (l.sourceId === path[i + 1] && l.targetId === path[i]),
-    )
-    const latency = link?.latency ?? 10
-    latencies.push(latency)
-    durations.push(
-      clamp(
-        SEGMENT_BASE_SECONDS + latency * SEGMENT_LATENCY_SCALE,
-        SEGMENT_MIN_SECONDS,
-        SEGMENT_MAX_SECONDS,
-      ),
-    )
-    bottleneckBw = Math.min(bottleneckBw, link?.bandwidth ?? 100)
-  }
-  return { durations, latencies, bottleneckBw: Number.isFinite(bottleneckBw) ? bottleneckBw : 0 }
+// Metrics for one hop a → b: animation duration, simulated one-way latency,
+// and the link's bandwidth. Appended to the packet each time a router forwards it.
+function hopMetrics(a: string, b: string, links: NetworkLink[]) {
+  const link = links.find(
+    l => (l.sourceId === a && l.targetId === b) || (l.sourceId === b && l.targetId === a),
+  )
+  const latency = link?.latency ?? 10
+  const duration = clamp(
+    SEGMENT_BASE_SECONDS + latency * SEGMENT_LATENCY_SCALE,
+    SEGMENT_MIN_SECONDS,
+    SEGMENT_MAX_SECONDS,
+  )
+  return { duration, latency, bandwidth: link?.bandwidth ?? 100 }
+}
+
+// Record the hop a → b on the packet: the router at `a` has decided to forward
+// to `b`, so the traveled path and its per-hop metrics grow by one entry.
+function takeHop(packet: Packet, b: string, links: NetworkLink[]): void {
+  const a = packet.path[packet.path.length - 1]
+  const { duration, latency, bandwidth } = hopMetrics(a, b, links)
+  packet.path.push(b)
+  packet.segmentDurations.push(duration)
+  packet.hopLatencies.push(latency)
+  packet.bottleneckBw = Math.min(packet.bottleneckBw, bandwidth)
 }
 
 // Control segments (handshake / ack / teardown) carry no payload.
@@ -62,7 +62,11 @@ export interface CreatePacketArgs {
   destinationId: string
   srcPort: number
   dstPort: number
-  path: string[]
+  // The sending host's routing decision — its forwarding-table next hop toward
+  // the destination. The rest of the route is decided router by router.
+  firstHopId: string
+  // Hop count of the planned route at send time (drives the loss model).
+  expectedHops: number
   links: NetworkLink[]
   simulationTimeMs: number
   lossProb: number
@@ -72,9 +76,8 @@ export interface CreatePacketArgs {
 export function createPacket(args: CreatePacketArgs): Packet {
   _packetCounter++
   const control = CONTROL_SEGMENTS.has(args.segment)
-  const { durations, latencies, bottleneckBw } = computePathMetrics(args.path, args.links)
 
-  return {
+  const packet: Packet = {
     id: `pkt-${_packetCounter}`,
     flowId: args.flowId,
     protocol: args.protocol,
@@ -84,8 +87,9 @@ export function createPacket(args: CreatePacketArgs): Packet {
     destinationId: args.destinationId,
     srcPort: args.srcPort,
     dstPort: args.dstPort,
-    path: args.path,
-    segmentDurations: durations,
+    path: [args.sourceId],
+    expectedHops: args.expectedHops,
+    segmentDurations: [],
     pathIndex: 0,
     progress: 0,
     createdAt: args.simulationTimeMs,
@@ -94,28 +98,41 @@ export function createPacket(args: CreatePacketArgs): Packet {
     color: PROTOCOL_COLORS[args.protocol],
     size: packetSize(args.segment),
     lossProb: args.lossProb,
-    hopLatencies: latencies,
-    bottleneckBw,
+    hopLatencies: [],
+    bottleneckBw: Infinity,
   }
+  takeHop(packet, args.firstHopId, args.links)
+  return packet
 }
 
 export function resetPacketCounter(): void {
   _packetCounter = 0
 }
 
-// Advance a packet along its path by deltaSeconds of real time.
-// Returns 'delivered' when it reaches the destination, 'dropped' if it is lost
-// in transit, or null while still in flight.
-export function stepPacket(packet: Packet, deltaSeconds: number): 'delivered' | 'dropped' | null {
+// A router's routing decision: given where the packet is and where it is
+// headed, return the neighbor to forward to (null = destination unreachable).
+export type NextHopLookup = (fromId: string, destId: string) => string | null
+
+// Advance a packet by deltaSeconds of real time. Each time it reaches a node,
+// that router looks the destination up via `lookup` and forwards it — the
+// packet never knows its route in advance. Returns 'delivered' when it reaches
+// the destination, 'dropped' if it is lost in transit or a router has no route
+// for it, or null while still in flight.
+export function stepPacket(
+  packet: Packet,
+  deltaSeconds: number,
+  lookup: NextHopLookup,
+  links: NetworkLink[],
+): 'delivered' | 'dropped' | null {
   if (packet.status !== 'in-flight') return null
 
-  // Overall progress along the whole path (for the loss check).
-  const segCount = Math.max(1, packet.path.length - 1)
   const duration = packet.segmentDurations[packet.pathIndex] ?? 0.3
   packet.progress += deltaSeconds / duration
 
-  // Lost packet: vanish once it passes its loss point.
+  // Lost packet: vanish once it passes its loss point (a fraction of the
+  // planned route, since the actual route unfolds hop by hop).
   if (packet.lossAt !== null) {
+    const segCount = Math.max(1, packet.expectedHops)
     const overall = (packet.pathIndex + Math.min(packet.progress, 1)) / segCount
     if (overall >= packet.lossAt) {
       packet.status = 'dropped'
@@ -127,11 +144,22 @@ export function stepPacket(packet: Packet, deltaSeconds: number): 'delivered' | 
     packet.pathIndex++
     packet.progress -= 1
 
-    if (packet.pathIndex >= packet.path.length - 1) {
+    // Arrived at a node: destination, or a router that must forward us.
+    const hereId = packet.path[packet.pathIndex]
+    if (hereId === packet.destinationId) {
       packet.status = 'delivered'
       packet.progress = 0
       return 'delivered'
     }
+
+    const nextId = lookup(hereId, packet.destinationId)
+    if (nextId === null) {
+      // This router has no route (e.g. the firewall came up mid-flight).
+      packet.status = 'dropped'
+      packet.progress = 0
+      return 'dropped'
+    }
+    takeHop(packet, nextId, links)
   }
 
   return null

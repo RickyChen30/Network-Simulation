@@ -66,7 +66,10 @@ export interface NetworkLink {
   bandwidth: number
 }
 
-// A packet is one segment of a flow, traveling a pre-computed path.
+// A packet is one segment of a flow. It does NOT carry a pre-computed route:
+// like a real IP packet it only knows its destination, and each router it
+// reaches looks that destination up in its own forwarding table to pick the
+// next hop. `path` is the record of hops taken so far, extended per hop.
 export interface Packet {
   id: string
   flowId: string
@@ -77,9 +80,13 @@ export interface Packet {
   destinationId: string
   srcPort: number
   dstPort: number
-  // Ordered list of node IDs the packet will traverse
+  // Hops taken so far (plus the next hop in progress) — grows as each router
+  // forwards the packet. Starts as [source, firstHop].
   path: string[]
-  // How long (real seconds) each path segment takes — derived from link latency.
+  // How many hops the planned route had at send time (for the loss model).
+  expectedHops: number
+  // How long (real seconds) each traversed segment takes — derived from link
+  // latency, appended as each hop is decided.
   segmentDurations: number[]
   // Index into path indicating which link we're currently on
   pathIndex: number
@@ -93,8 +100,8 @@ export interface Packet {
   // Extra realism / inspector fields:
   size: number // bytes
   lossProb: number // this flow's path loss probability (0..1)
-  hopLatencies: number[] // one-way ms for each hop (path[i] → path[i+1])
-  bottleneckBw: number // min link bandwidth along the path
+  hopLatencies: number[] // one-way ms for each hop taken (path[i] → path[i+1])
+  bottleneckBw: number // min link bandwidth seen so far along the path
 }
 
 export interface SimulationStats {

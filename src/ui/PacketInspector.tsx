@@ -83,6 +83,9 @@ export function PacketInspector({ packet, nodeMap, onClose }: PacketInspectorPro
   const currentHop = atEnd
     ? `Arrived at ${label(hops[hops.length - 1])}`
     : `${label(hops[packet.pathIndex])} → ${label(hops[packet.pathIndex + 1])}`
+  // Per-hop forwarding: the route past the next hop hasn't been decided yet —
+  // each router picks it from its forwarding table when the packet arrives.
+  const routeKnown = hops[hops.length - 1] === packet.destinationId
 
   return (
     <div className="absolute right-4 top-4 w-72 max-h-[calc(100vh-2rem)] overflow-y-auto bg-slate-950/85 backdrop-blur-md border border-white/10 rounded-xl p-4 shadow-2xl select-none">
@@ -122,10 +125,17 @@ export function PacketInspector({ packet, nodeMap, onClose }: PacketInspectorPro
       {/* Connection */}
       <Section title="Connection">
         <Row label="Current Hop" value={currentHop} />
-        <Row label="Hop Count" value={`${hops.length - 1} hops`} mono />
+        <Row label="Destination" value={label(packet.destinationId)} />
+        <Row
+          label="Hop Count"
+          value={routeKnown ? `${hops.length - 1} hops` : `${hops.length - 1} of ~${packet.expectedHops} hops`}
+          mono
+        />
         <Row label="Next Hop" value={nextHop} />
         <div className="mt-1">
-          <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Route</div>
+          <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">
+            Route · decided hop-by-hop
+          </div>
           <div className="flex flex-wrap gap-x-1 gap-y-0.5 text-[11px] leading-tight">
             {hops.map((h, i) => (
               <span key={i} className="flex items-center gap-1">
@@ -135,6 +145,14 @@ export function PacketInspector({ packet, nodeMap, onClose }: PacketInspectorPro
                 {i < hops.length - 1 && <span className="text-slate-600">→</span>}
               </span>
             ))}
+            {!routeKnown && (
+              <span className="flex items-center gap-1 text-slate-600">
+                <span>→</span>
+                <span>⋯</span>
+                <span>→</span>
+                <span className="text-slate-500 italic">{label(packet.destinationId)}</span>
+              </span>
+            )}
           </div>
         </div>
       </Section>
@@ -164,7 +182,7 @@ export function PacketInspector({ packet, nodeMap, onClose }: PacketInspectorPro
                         boxShadow: reached || current ? `0 0 6px ${dotColor}` : 'none',
                       }}
                     />
-                    {i < hops.length - 1 && <span className="w-px flex-1 min-h-[10px] bg-white/10" />}
+                    {(i < hops.length - 1 || !routeKnown) && <span className="w-px flex-1 min-h-[10px] bg-white/10" />}
                   </div>
                   <div className="flex-1 flex justify-between items-baseline pb-1.5">
                     <span className={`text-[11px] ${reached ? 'text-slate-100' : current ? 'text-amber-200' : 'text-slate-500'}`}>
@@ -179,6 +197,18 @@ export function PacketInspector({ packet, nodeMap, onClose }: PacketInspectorPro
                 </div>
               )
             })}
+            {!routeKnown && (
+              <div className="flex items-stretch gap-2">
+                <div className="flex flex-col items-center pt-1">
+                  <span className="w-2 h-2 rounded-full shrink-0 border border-slate-600" />
+                </div>
+                <div className="flex-1 flex justify-between items-baseline pb-1.5">
+                  <span className="text-[11px] text-slate-500 italic">
+                    {label(packet.destinationId)} · route pending
+                  </span>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </Section>

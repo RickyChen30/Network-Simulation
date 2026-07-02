@@ -1,5 +1,6 @@
 import type { NetworkNode, NetworkLink } from '../types/network'
 import { INITIAL_NODES, INITIAL_LINKS } from '../config/topology'
+import { buildForwardingTables, type ForwardingTable } from './routing'
 
 // Network graph manager — owns the authoritative node and link data.
 // Rendering reads from here; it never mutates the graph directly.
@@ -10,12 +11,43 @@ export class NetworkGraph {
 
   // Cached position lookup for O(1) access during packet animation
   private _positionCache: Map<string, [number, number, number]>
+  // Per-router forwarding tables (nodeId → destId → next hop), recomputed
+  // whenever the usable topology changes (firewall toggle, reset).
+  private _forwarding: Map<string, ForwardingTable>
 
   constructor() {
     // Deep clone the static topology so resets are cheap and isolated
     this.nodes = INITIAL_NODES.map(n => ({ ...n }))
     this.links = INITIAL_LINKS.map(l => ({ ...l }))
     this._positionCache = this._buildPositionCache()
+    this._forwarding = buildForwardingTables(this.getActiveNodes(), this.getActiveLinks())
+  }
+
+  private _rebuildForwarding(): void {
+    this._forwarding = buildForwardingTables(this.getActiveNodes(), this.getActiveLinks())
+  }
+
+  // The per-hop routing decision: the router at `fromId` looks up `destId` in
+  // its own table and returns the neighbor to forward to, or null if it has no
+  // route (destination unreachable — e.g. behind a raised firewall).
+  getNextHop(fromId: string, destId: string): string | null {
+    return this._forwarding.get(fromId)?.get(destId) ?? null
+  }
+
+  // Trace the route hop by hop through the forwarding tables — what a packet
+  // will actually experience. Used for planning (loss/RTT estimates), never
+  // carried by packets. Null if some router along the way has no route.
+  getRoute(srcId: string, dstId: string): string[] | null {
+    const route = [srcId]
+    let cursor = srcId
+    while (cursor !== dstId) {
+      const next = this.getNextHop(cursor, dstId)
+      if (next === null) return null
+      route.push(next)
+      cursor = next
+      if (route.length > this.nodes.length) return null // table loop guard
+    }
+    return route
   }
 
   private _buildPositionCache(): Map<string, [number, number, number]> {
@@ -43,6 +75,9 @@ export class NetworkGraph {
     for (const node of this.nodes) {
       if (node.type === 'datacenter') node.active = !node.active
     }
+    // Routers "reconverge" on the new topology: routes through the blocked
+    // data centers disappear from every forwarding table.
+    this._rebuildForwarding()
   }
 
   isFirewallUp(): boolean {
@@ -66,5 +101,6 @@ export class NetworkGraph {
     this.nodes = INITIAL_NODES.map(n => ({ ...n }))
     this.links = INITIAL_LINKS.map(l => ({ ...l }))
     this._positionCache = this._buildPositionCache()
+    this._rebuildForwarding()
   }
 }

@@ -1,6 +1,6 @@
 import type { Packet, SimulationStats, RoutingMode, Protocol, Segment } from '../types/network'
 import { NetworkGraph } from './network'
-import { findShortestPath, computePathLatency } from './routing'
+import { computePathLatency } from './routing'
 import { createPacket, resetPacketCounter, stepPacket } from './packet'
 import { MAX_ACTIVE_PACKETS, PACKET_LINGER_MS, LATENCY_WINDOW } from '../config/constants'
 
@@ -195,7 +195,10 @@ export class SimulationEngine {
 
     const srcId = homes[Math.floor(Math.random() * homes.length)]
     const dstId = servers[Math.floor(Math.random() * servers.length)]
-    const fwdPath = findShortestPath(srcId, dstId, this.graph.getActiveNodes(), this.graph.getActiveLinks())
+    // Planned route, traced through the routers' forwarding tables. The flow
+    // keeps it only for estimates (loss probability, RTT); packets themselves
+    // are forwarded hop by hop and never carry it.
+    const fwdPath = this.graph.getRoute(srcId, dstId)
 
     // No route (e.g. firewall up) → the connection attempt fails immediately.
     if (!fwdPath) {
@@ -269,15 +272,28 @@ export class SimulationEngine {
     const baseLoss = dns ? flow.dnsLossProb : flow.lossProb
     const lossProb = baseLoss * (this._isDDoS ? DDOS_CONGESTION : 1)
     const lossAt = Math.random() < lossProb ? 0.3 + Math.random() * 0.5 : null
+
+    // The sending host makes only the first routing decision; every later hop
+    // is chosen by the router the packet lands on. No route at the source
+    // (e.g. firewall raised mid-flow) → the send fails outright, and TCP's
+    // retransmit timer will retry / give up as usual.
+    const destinationId = path[path.length - 1]
+    const firstHopId = this.graph.getNextHop(path[0], destinationId)
+    if (firstHopId === null) {
+      this._dropped++
+      return
+    }
+
     const packet = createPacket({
       flowId: flow.id,
       protocol: dns ? 'UDP' : flow.protocol, // DNS rides UDP whatever the flow is
       segment: retx ? 'RETX' : step.segment,
       sourceId: path[0],
-      destinationId: path[path.length - 1],
+      destinationId,
       srcPort: flow.srcPort,
       dstPort: dns ? 53 : flow.dstPort,
-      path,
+      firstHopId,
+      expectedHops: path.length - 1,
       links: this.graph.links,
       simulationTimeMs: now,
       lossProb: baseLoss,
@@ -330,9 +346,12 @@ export class SimulationEngine {
   }
 
   private _stepPackets(deltaSeconds: number, realTimeMs: number): void {
+    // Each router a packet reaches makes its own forwarding decision by
+    // looking the destination up in that node's forwarding table.
+    const lookup = (fromId: string, destId: string) => this.graph.getNextHop(fromId, destId)
     for (const packet of this.packets) {
       if (packet.status !== 'in-flight') continue
-      const result = stepPacket(packet, deltaSeconds)
+      const result = stepPacket(packet, deltaSeconds, lookup, this.graph.links)
       if (result === 'delivered') {
         this._onDelivered(packet, realTimeMs)
         this._lingerTimers.set(packet.id, realTimeMs + PACKET_LINGER_MS)
