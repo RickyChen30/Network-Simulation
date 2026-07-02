@@ -49,6 +49,8 @@ const CONTROL_SEGMENTS = new Set<Segment>([
 function packetSize(segment: Segment): number {
   if (CONTROL_SEGMENTS.has(segment)) return 40 + Math.floor(Math.random() * 20) // 40–60 B
   if (segment === 'ECHO' || segment === 'REPLY') return 64
+  if (segment === 'DNS-QUERY') return 60 + Math.floor(Math.random() * 20) // 60–80 B
+  if (segment === 'DNS-RESPONSE') return 120 + Math.floor(Math.random() * 60) // 120–180 B
   return 512 + Math.floor(Math.random() * 988) // 512–1500 B payload
 }
 

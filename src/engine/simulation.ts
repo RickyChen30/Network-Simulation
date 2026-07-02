@@ -14,6 +14,9 @@ interface FlowStep {
   segment: Segment
   dir: 'fwd' | 'ret'
   wait: boolean
+  // 'dns' steps ride the short city → resolver path as UDP port 53,
+  // regardless of the flow's own protocol.
+  phase?: 'dns'
 }
 
 interface Flow {
@@ -23,6 +26,10 @@ interface Flow {
   dstId: string
   fwdPath: string[]
   revPath: string[]
+  // Path to the city's DNS resolver (its uplink hub), when this flow had to
+  // resolve the server's name first; null on a resolver-cache hit.
+  dnsPath: string[] | null
+  dnsRevPath: string[] | null
   srcPort: number
   dstPort: number
   steps: FlowStep[]
@@ -35,6 +42,7 @@ interface Flow {
   rttRecorded: boolean
   lastEmit: number
   lossProb: number // per-packet loss probability for this flow's path
+  dnsLossProb: number // same, for the short DNS path
   done: boolean
 }
 
@@ -44,6 +52,9 @@ const TCP_TIMEOUT_MS = 1100 // retransmit timeout for an un-acked TCP segment
 const UDP_STAGGER_MS = 110 // gap between UDP datagrams
 const MAX_RETX = 4
 const DDOS_CONGESTION = 6 // loss multiplier while a link is being flooded
+// How long a resolved name stays in a city's DNS cache — flows from that city
+// to the same server within the TTL skip the lookup.
+const DNS_TTL_MS = 45_000
 
 // Realistic per-link packet-loss probability, driven by link quality: fiber
 // backbone and subsea cables are near-lossless; access / last-mile links lose a
@@ -112,9 +123,12 @@ export class SimulationEngine {
   private _completed: number
   private _dropped: number
   private _retransmits: number
+  private _dnsLookups: number
   private _recentRtts: number[]
   private _spawnAccumulator: number
   private _lingerTimers: Map<string, number>
+  // Per-city resolver cache: "srcId>dstId" → sim time (ms) the entry expires.
+  private _dnsCache: Map<string, number>
 
   onStateChange?: (stats: SimulationStats, packets: Packet[]) => void
 
@@ -128,15 +142,17 @@ export class SimulationEngine {
     this._completed = 0
     this._dropped = 0
     this._retransmits = 0
+    this._dnsLookups = 0
     this._recentRtts = []
     this._spawnAccumulator = 0
     this._lingerTimers = new Map()
+    this._dnsCache = new Map()
   }
 
   tick(deltaSeconds: number, realTimeMs: number): void {
     if (this._isPaused) return
 
-    this._spawnFlows(deltaSeconds)
+    this._spawnFlows(deltaSeconds, realTimeMs)
     this._processFlows(realTimeMs)
     this._stepPackets(deltaSeconds, realTimeMs)
     this._pruneLingeredPackets(realTimeMs)
@@ -149,7 +165,7 @@ export class SimulationEngine {
     return this.packets.some(p => p.flowId === flowId && p.status === 'in-flight')
   }
 
-  private _spawnFlows(deltaSeconds: number): void {
+  private _spawnFlows(deltaSeconds: number, now: number): void {
     const active = this._flows.filter(f => !f.done).length
     if (active >= MAX_FLOWS) return
     if (this.packets.filter(p => p.status === 'in-flight').length >= MAX_ACTIVE_PACKETS) return
@@ -158,11 +174,21 @@ export class SimulationEngine {
     this._spawnAccumulator += rate * deltaSeconds
     while (this._spawnAccumulator >= 1) {
       this._spawnAccumulator -= 1
-      this._createFlow()
+      this._createFlow(now)
     }
   }
 
-  private _createFlow(): void {
+  // A city's uplink hub doubles as its ISP's recursive DNS resolver, so a
+  // lookup is one short hop up the access link and back.
+  private _resolverPath(cityId: string): string[] | null {
+    const link = this.graph
+      .getActiveLinks()
+      .find(l => l.sourceId === cityId || l.targetId === cityId)
+    if (!link) return null
+    return [cityId, link.sourceId === cityId ? link.targetId : link.sourceId]
+  }
+
+  private _createFlow(now: number): void {
     const homes = this.graph.getHomeIds()
     const servers = this.graph.getServerIds()
     if (homes.length === 0 || servers.length === 0) return
@@ -178,6 +204,22 @@ export class SimulationEngine {
     }
 
     const protocol = pickProtocol(this._isDDoS)
+    const dstPort = destPort(protocol)
+
+    // DNS resolution: before the city can open the flow it must resolve the
+    // server's name at its local resolver, unless the answer is still cached.
+    // Flows already destined to port 53 ARE DNS traffic and skip this.
+    const cached = (this._dnsCache.get(`${srcId}>${dstId}`) ?? 0) > now
+    const dnsPath = dstPort !== 53 && !cached ? this._resolverPath(srcId) : null
+    const steps = buildSteps(protocol)
+    if (dnsPath) {
+      steps.unshift(
+        { segment: 'DNS-QUERY', dir: 'fwd', wait: true, phase: 'dns' },
+        { segment: 'DNS-RESPONSE', dir: 'ret', wait: true, phase: 'dns' },
+      )
+      this._dnsLookups++
+    }
+
     _flowCounter++
     this._flows.push({
       id: `flow-${_flowCounter}`,
@@ -186,9 +228,11 @@ export class SimulationEngine {
       dstId,
       fwdPath,
       revPath: [...fwdPath].reverse(),
+      dnsPath,
+      dnsRevPath: dnsPath ? [...dnsPath].reverse() : null,
       srcPort: 49152 + Math.floor(Math.random() * 16000),
-      dstPort: destPort(protocol),
-      steps: buildSteps(protocol),
+      dstPort,
+      steps,
       stepIndex: 0,
       awaiting: false,
       awaitingPacketId: null,
@@ -198,6 +242,7 @@ export class SimulationEngine {
       rttRecorded: false,
       lastEmit: 0,
       lossProb: this._pathLossProb(fwdPath),
+      dnsLossProb: dnsPath ? this._pathLossProb(dnsPath) : 0,
       done: false,
     })
   }
@@ -217,21 +262,25 @@ export class SimulationEngine {
   }
 
   private _emit(flow: Flow, step: FlowStep, now: number, retx: boolean): void {
-    const path = step.dir === 'fwd' ? flow.fwdPath : flow.revPath
-    const lossProb = flow.lossProb * (this._isDDoS ? DDOS_CONGESTION : 1)
+    const dns = step.phase === 'dns'
+    const path = dns
+      ? (step.dir === 'fwd' ? flow.dnsPath! : flow.dnsRevPath!)
+      : (step.dir === 'fwd' ? flow.fwdPath : flow.revPath)
+    const baseLoss = dns ? flow.dnsLossProb : flow.lossProb
+    const lossProb = baseLoss * (this._isDDoS ? DDOS_CONGESTION : 1)
     const lossAt = Math.random() < lossProb ? 0.3 + Math.random() * 0.5 : null
     const packet = createPacket({
       flowId: flow.id,
-      protocol: flow.protocol,
+      protocol: dns ? 'UDP' : flow.protocol, // DNS rides UDP whatever the flow is
       segment: retx ? 'RETX' : step.segment,
       sourceId: path[0],
       destinationId: path[path.length - 1],
       srcPort: flow.srcPort,
-      dstPort: flow.dstPort,
+      dstPort: dns ? 53 : flow.dstPort,
       path,
       links: this.graph.links,
       simulationTimeMs: now,
-      lossProb: flow.lossProb,
+      lossProb: baseLoss,
       lossAt,
     })
     this.packets.push(packet)
@@ -285,7 +334,7 @@ export class SimulationEngine {
       if (packet.status !== 'in-flight') continue
       const result = stepPacket(packet, deltaSeconds)
       if (result === 'delivered') {
-        this._onDelivered(packet)
+        this._onDelivered(packet, realTimeMs)
         this._lingerTimers.set(packet.id, realTimeMs + PACKET_LINGER_MS)
       } else if (result === 'dropped') {
         this._dropped++
@@ -294,7 +343,7 @@ export class SimulationEngine {
     }
   }
 
-  private _onDelivered(packet: Packet): void {
+  private _onDelivered(packet: Packet, now: number): void {
     const flow = this._flows.find(f => f.id === packet.flowId)
     if (!flow) return
 
@@ -309,6 +358,11 @@ export class SimulationEngine {
     }
 
     if (flow.awaiting && packet.id === flow.awaitingPacketId) {
+      // The resolver's answer made it back to the city → cache it there.
+      // (Checked via the awaited step so a retransmitted answer counts too.)
+      if (flow.awaitingStep?.segment === 'DNS-RESPONSE') {
+        this._dnsCache.set(`${flow.srcId}>${flow.dstId}`, now + DNS_TTL_MS)
+      }
       flow.awaiting = false
       flow.awaitingPacketId = null
       flow.awaitingStep = null
@@ -352,6 +406,7 @@ export class SimulationEngine {
       completed: this._completed,
       droppedPackets: this._dropped,
       retransmits: this._retransmits,
+      dnsLookups: this._dnsLookups,
       averageLatency: Math.round(avg),
       protocolMix,
       routingMode: this._routingMode,
@@ -387,9 +442,11 @@ export class SimulationEngine {
     this._completed = 0
     this._dropped = 0
     this._retransmits = 0
+    this._dnsLookups = 0
     this._recentRtts = []
     this._spawnAccumulator = 0
     this._lingerTimers.clear()
+    this._dnsCache.clear()
     this._isPaused = false
     this._routingMode = 'shortest-path'
     this._isDDoS = false

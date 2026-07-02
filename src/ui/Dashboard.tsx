@@ -44,6 +44,7 @@ export function Dashboard({ stats }: DashboardProps) {
         <StatRow label="Completed" value={stats.completed} color="text-emerald-400" />
         <StatRow label="Dropped" value={stats.droppedPackets} color="text-rose-400" />
         <StatRow label="Retransmits" value={stats.retransmits} color="text-orange-300" />
+        <StatRow label="DNS Lookups" value={stats.dnsLookups} color="text-violet-300" />
         <StatRow label="Avg RTT" value={`${stats.averageLatency} ms`} color="text-amber-300" />
         <StatRow
           label="Routing"

@@ -35,6 +35,8 @@ export type Segment =
   | 'DATAGRAM' // UDP
   | 'ECHO' // ICMP request
   | 'REPLY' // ICMP reply
+  | 'DNS-QUERY' // resolve the server's name before the flow starts (UDP :53)
+  | 'DNS-RESPONSE' // the resolver's answer back to the city
 
 export type PacketStatus = 'in-flight' | 'delivered' | 'dropped'
 
@@ -101,6 +103,7 @@ export interface SimulationStats {
   completed: number        // flows that finished successfully
   droppedPackets: number   // packets lost in transit (or with no route)
   retransmits: number      // TCP segments resent after loss
+  dnsLookups: number       // name resolutions performed (cache misses)
   // Rolling average round-trip time (ms), measured SYN → SYN-ACK etc.
   averageLatency: number
   // Live packet count per protocol

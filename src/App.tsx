@@ -15,6 +15,7 @@ const DEFAULT_STATS: SimulationStats = {
   completed: 0,
   droppedPackets: 0,
   retransmits: 0,
+  dnsLookups: 0,
   averageLatency: 0,
   protocolMix: { TCP: 0, UDP: 0, ICMP: 0 },
   routingMode: 'shortest-path',
