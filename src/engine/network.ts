@@ -34,6 +34,12 @@ export class NetworkGraph {
     return this._forwarding.get(fromId)?.get(destId) ?? null
   }
 
+  // A node's whole forwarding table (destination → next hop), for the UI.
+  // The returned map is live engine state — read, don't mutate.
+  getForwardingTable(nodeId: string): ForwardingTable | null {
+    return this._forwarding.get(nodeId) ?? null
+  }
+
   // Trace the route hop by hop through the forwarding tables — what a packet
   // will actually experience. Used for planning (loss/RTT estimates), never
   // carried by packets. Null if some router along the way has no route.

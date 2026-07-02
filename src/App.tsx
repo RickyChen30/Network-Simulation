@@ -7,6 +7,7 @@ import { Dashboard } from './ui/Dashboard'
 import { Controls } from './ui/Controls'
 import { Legend } from './ui/Legend'
 import { PacketInspector } from './ui/PacketInspector'
+import { ForwardingTablePanel } from './ui/ForwardingTablePanel'
 import { CAMERA_POSITION } from './config/constants'
 
 const DEFAULT_STATS: SimulationStats = {
@@ -135,9 +136,19 @@ export default function App() {
         />
       </Canvas>
 
-      {/* HUD overlays — the right column stacks the legend and controls, and
-          yields the space to the packet inspector while riding along. */}
-      <Dashboard stats={stats} />
+      {/* HUD overlays — the left column stacks telemetry above the focused
+          city's forwarding table; the right column stacks the legend and
+          controls, and yields to the packet inspector while riding along. */}
+      <div className="absolute top-4 left-4 bottom-4 w-64 flex flex-col gap-3 pointer-events-none">
+        <Dashboard stats={stats} />
+        {focusedNode && viewMode === 'city' && !selectedPacket && (
+          <ForwardingTablePanel
+            node={focusedNode}
+            table={engine.graph.getForwardingTable(focusedNode.id)}
+            nodeMap={nodeMap}
+          />
+        )}
+      </div>
       {!selectedPacket && (
         <div className="absolute top-4 right-4 w-52 flex flex-col gap-3">
           <Legend />
@@ -202,13 +213,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Title */}
-      <div className="absolute bottom-4 right-4 text-right pointer-events-none select-none">
-        <p className="text-xl font-bold text-white tracking-[0.25em] uppercase">
-          Globe<span className="text-teal-400">Net</span>
-        </p>
-        <p className="text-[11px] text-slate-500 tracking-wide">Global Internet Packet Simulator</p>
-      </div>
     </div>
   )
 }

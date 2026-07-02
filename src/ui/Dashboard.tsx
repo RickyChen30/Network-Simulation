@@ -28,7 +28,7 @@ export function Dashboard({ stats }: DashboardProps) {
   }
 
   return (
-    <div className="absolute top-4 left-4 w-60 bg-slate-950/70 backdrop-blur-md border border-white/10 rounded-xl p-4 shadow-2xl pointer-events-none select-none">
+    <div className="bg-slate-950/70 backdrop-blur-md border border-white/10 rounded-xl p-4 shadow-2xl pointer-events-none select-none shrink-0">
       <div className="flex items-center gap-2 mb-3">
         <span
           className={`w-2 h-2 rounded-full ${stats.isPaused ? 'bg-amber-400' : 'bg-emerald-400 animate-pulse'}`}
