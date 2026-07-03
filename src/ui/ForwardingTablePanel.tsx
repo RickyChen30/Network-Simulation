@@ -1,18 +1,21 @@
 import { useMemo } from 'react'
-import type { NetworkNode } from '../types/network'
+import type { NetworkNode, BgpRouteView } from '../types/network'
 import { NODE_COLORS } from '../config/topology'
 
 interface ForwardingTablePanelProps {
   node: NetworkNode
   // The node's live forwarding table: destination id → next-hop neighbor id.
   table: Map<string, string> | null
+  // The node's AS and its current BGP best routes toward every other AS.
+  bgpTable: BgpRouteView[]
+  bgpConverging: boolean
   nodeMap: Map<string, NetworkNode>
 }
 
 // The focused city's forwarding table, grouped by next hop — so a stub city
 // reads as one big "everything via my uplink" group (a default route), while
 // backbone hubs show real fan-out across several neighbors.
-export function ForwardingTablePanel({ node, table, nodeMap }: ForwardingTablePanelProps) {
+export function ForwardingTablePanel({ node, table, bgpTable, bgpConverging, nodeMap }: ForwardingTablePanelProps) {
   const label = (id: string) => nodeMap.get(id)?.label ?? id
 
   const groups = useMemo(() => {
@@ -50,6 +53,29 @@ export function ForwardingTablePanel({ node, table, nodeMap }: ForwardingTablePa
       </div>
 
       <div className="px-4 pb-4 overflow-y-auto">
+        {/* The AS's BGP view: best AS path per destination AS */}
+        <div className="mb-3">
+          <div className="flex items-baseline justify-between border-b border-white/10 pb-1 mb-1.5">
+            <span className="text-[10px] text-slate-400 uppercase tracking-[0.16em]">
+              BGP · AS {node.as ?? node.continent}
+            </span>
+            <span className={`text-[10px] ${bgpConverging ? 'text-amber-300' : 'text-emerald-400'}`}>
+              {bgpConverging ? 'converging…' : 'converged'}
+            </span>
+          </div>
+          {bgpTable.length === 0 && (
+            <p className="text-[11px] text-rose-300/90">No external routes (withdrawn / isolated).</p>
+          )}
+          {bgpTable.map(r => (
+            <div key={r.destAs} className="flex justify-between items-baseline gap-2 py-0.5">
+              <span className="text-[11px] text-slate-300 shrink-0">{r.destAs}</span>
+              <span className="text-[10px] font-mono text-sky-300/90 text-right">
+                {r.asPath.join(' → ')}
+              </span>
+            </div>
+          ))}
+        </div>
+
         {groups.length === 0 && (
           <p className="text-xs text-rose-300/90">No routes — this node is unreachable (firewall?).</p>
         )}

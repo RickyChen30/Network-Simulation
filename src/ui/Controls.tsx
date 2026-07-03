@@ -11,6 +11,7 @@ const BINDINGS: Binding[] = [
   { key: 'A', label: 'Adaptive routing' },
   { key: 'D', label: 'DDoS burst' },
   { key: 'F', label: 'Toggle firewall' },
+  { key: 'C', label: 'Cut / repair a cable' },
   { key: 'ESC', label: 'Back to globe' },
 ]
 

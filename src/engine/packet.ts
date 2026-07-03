@@ -6,6 +6,7 @@ import {
   SEGMENT_LATENCY_SCALE,
   SEGMENT_MIN_SECONDS,
   SEGMENT_MAX_SECONDS,
+  TTL_MAX_HOPS,
 } from '../config/constants'
 
 let _packetCounter = 0
@@ -158,6 +159,14 @@ export function stepPacket(
       packet.status = 'delivered'
       packet.progress = 0
       return 'delivered'
+    }
+
+    // TTL exceeded: kills packets caught in transient forwarding loops while
+    // BGP re-converges (each router decrements the TTL like real IP).
+    if (packet.pathIndex >= TTL_MAX_HOPS) {
+      packet.status = 'dropped'
+      packet.progress = 0
+      return 'dropped'
     }
 
     const nextId = ctx.nextHop(hereId, packet.destinationId)

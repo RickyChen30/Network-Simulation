@@ -92,6 +92,17 @@ export function findShortestPath(
   return path
 }
 
+// Cumulative latency from `sourceId` to every reachable node (Infinity when
+// unreachable). Used for hot-potato egress selection in the BGP layer.
+export function shortestDistances(
+  sourceId: string,
+  nodes: NetworkNode[],
+  links: NetworkLink[],
+): Map<string, number> {
+  const adj = buildAdjacency(nodes, links)
+  return dijkstraFrom(sourceId, nodes, adj).dist
+}
+
 // A router's forwarding table: destination node ID → next-hop neighbor ID.
 export type ForwardingTable = Map<string, string>
 

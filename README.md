@@ -40,6 +40,7 @@ Then open [http://localhost:5173](http://localhost:5173).
 | A      | Toggle adaptive-routing mode flag (placeholder for now)       |
 | D      | DDoS — flood one victim server with unpaced TCP connections   |
 | F      | Toggle the data-center firewalls (routes reconverge live)     |
+| C      | Cut / repair a submarine cable — BGP withdraws & re-converges |
 | Esc    | Exit the packet ride / fly back out to the whole-globe view   |
 | Click  | A city → fly in · a packet → ride along + inspect it          |
 | Drag / Scroll | Spin the globe / zoom                                  |
@@ -120,7 +121,48 @@ Consequences you can observe:
   like real convergence events.
 - The TTL readout in the inspector decrements per actual router traversed.
 
-### 4. TCP — handshake, sliding window, congestion control
+### 4. Autonomous systems and BGP
+
+Each **continent is an autonomous system** (a border city whose only uplink
+crosses continents joins its provider hub's AS, like a single-homed customer).
+Routing runs at two levels, the way the real internet does:
+
+- **Inside an AS (IGP):** plain latency-weighted Dijkstra over the continent's
+  own links fills the intra-AS part of every forwarding table.
+- **Between ASes (BGP):** the submarine cables are eBGP sessions. Every AS
+  originates its prefix and advertises routes carrying the full **AS_PATH**;
+  a receiver rejects any path containing its own AS (loop prevention), keeps
+  one candidate per neighbor, and runs the **decision process**: shortest
+  AS_PATH wins, lowest next-hop AS breaks ties. External traffic leaves via
+  the router's nearest egress toward the chosen next-hop AS (**hot potato**),
+  and the selected routes are installed into the same forwarding tables the
+  packets consult (RIB → FIB).
+
+The dynamics are the realistic part. BGP updates are **messages with per-
+session propagation delay, paced by an MRAI timer** — nothing converges
+instantly (except the initial boot, which starts at steady state). Press `C`
+to cut a submarine cable:
+
+- If it was the **last cable between two ASes, the eBGP session drops** and
+  both sides **withdraw** everything learned across it, then advertise their
+  new (longer or vanished) best paths to their remaining neighbors.
+- The change **ripples outward AS by AS over seconds** — the dashboard shows
+  "Converging…" while updates are in flight. Distant ASes keep routing on
+  stale paths meanwhile: packets get black-holed at routers with no route, or
+  briefly loop between ASes until their **TTL (32 hops)** expires — and
+  "path hunting" (an AS trying progressively longer stale routes before
+  settling) emerges by itself.
+- After convergence, traffic visibly reroutes — cut Europe–Africa and Lagos
+  traffic swings around via Asia; cut Asia–Oceania and Sydney reaches
+  Singapore the long way through North America. Press `C` again to repair the
+  cable: the session re-establishes, full tables are re-exchanged (with the
+  same delays), and the short paths return.
+
+Click any city to see its AS's **BGP table** (best AS path per destination AS,
+live convergence state) above its forwarding table; ride a packet and the
+inspector shows the **AS Path** it actually crossed.
+
+### 5. TCP — handshake, sliding window, congestion control
 
 TCP flows run the full connection lifecycle:
 
@@ -163,7 +205,7 @@ UDP, by contrast, just streams datagrams (no handshake, no ACKs, no recovery),
 and ICMP does echo/reply ping rounds — the classic reliability trade-off,
 side by side.
 
-### 5. Router queues and bandwidth limits
+### 6. Router queues and bandwidth limits
 
 Links aren't infinitely fast. Every directed link is a **router output port**
 that transmits one packet at a time; transmission takes
@@ -182,7 +224,7 @@ doubling pile into the bottleneck queue, the queue overflows, the drop times
 out at the sender, and the window halves. Congestion control emerges from the
 queues instead of being scripted.
 
-### 6. Packet loss
+### 7. Packet loss
 
 Two independent loss mechanisms:
 
@@ -194,7 +236,7 @@ Two independent loss mechanisms:
 - **Congestion loss** — the queue tail drops above. Deterministic, load-driven,
   and the dominant source of drops under DDoS.
 
-### 7. DDoS — emergent congestion collapse
+### 8. DDoS — emergent congestion collapse
 
 Pressing `D` doesn't multiply a loss dial — it launches an actual flood:
 
@@ -209,7 +251,7 @@ window collapses — congestion collapse as an emergent property, not a
 hard-coded effect. Legitimate cross-traffic sharing those links suffers
 collateral queueing delay and loss.
 
-### 8. Firewalls
+### 9. Firewalls
 
 `F` toggles the data centers off. The forwarding tables reconverge without
 them, so new flows fail instantly at the source ("no route") and in-flight
@@ -247,8 +289,10 @@ src/
   engine/                 # pure simulation logic (no rendering)
     simulation.ts         # flows: DNS, TCP/UDP/ICMP state machines, cwnd,
                           #   retransmits, DDoS, stats
-    network.ts            # node/link graph, forwarding tables, firewall state
+    network.ts            # node/link graph, AS membership, IGP+BGP → FIB, cable cuts
     routing.ts            # Dijkstra + per-destination forwarding-table builder
+    bgp.ts                # eBGP between continent-ASes: AS_PATH selection,
+                          #   withdrawals, delayed update propagation (MRAI)
     packet.ts             # per-hop packet lifecycle: forward, queue, drop, arc position
     queues.ts             # router output ports: bandwidth service rate + FIFO queues
   rendering/              # React Three Fiber scene

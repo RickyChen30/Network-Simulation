@@ -23,6 +23,8 @@ const DEFAULT_STATS: SimulationStats = {
   protocolMix: { TCP: 0, UDP: 0, ICMP: 0 },
   routingMode: 'shortest-path',
   isPaused: false,
+  bgpConverging: false,
+  cutCable: null,
 }
 
 export default function App() {
@@ -100,6 +102,9 @@ export default function App() {
         case 'KeyF':
           engine.toggleFirewall()
           break
+        case 'KeyC':
+          engine.toggleCableCut()
+          break
         case 'Escape':
           // Deselect a followed packet first, otherwise leave the focus view.
           setSelectedFlowId(prev => {
@@ -145,6 +150,8 @@ export default function App() {
           <ForwardingTablePanel
             node={focusedNode}
             table={engine.graph.getForwardingTable(focusedNode.id)}
+            bgpTable={focusedNode.as ? engine.graph.getBgpTable(focusedNode.as) : []}
+            bgpConverging={stats.bgpConverging}
             nodeMap={nodeMap}
           />
         )}

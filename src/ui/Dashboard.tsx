@@ -53,6 +53,12 @@ export function Dashboard({ stats }: DashboardProps) {
           value={modeLabel[stats.routingMode] ?? stats.routingMode}
           color="text-purple-300"
         />
+        <StatRow
+          label="BGP"
+          value={stats.bgpConverging ? 'Converging…' : 'Converged'}
+          color={stats.bgpConverging ? 'text-amber-300' : 'text-emerald-400'}
+        />
+        {stats.cutCable && <StatRow label="Cable Cut" value={stats.cutCable} color="text-rose-400" />}
       </div>
 
       {/* Live protocol mix */}

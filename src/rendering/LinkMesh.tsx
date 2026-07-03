@@ -36,13 +36,21 @@ export function LinkMesh({ link, nodes }: LinkMeshProps) {
 
   if (points.length < 2 || !source || !target) return null
 
-  const isActive = source.active && target.active
-  const baseOpacity = isActive ? 0.18 : 0.04
+  const isCut = link.cut === true
+  const isActive = source.active && target.active && !isCut
+  const baseOpacity = isCut ? 0.45 : isActive ? 0.18 : 0.04
   const flowOpacity = isActive ? 0.55 : 0
 
   return (
     <group>
-      <Line points={points} color="#1f5e86" lineWidth={1} transparent opacity={baseOpacity} />
+      {/* A cut submarine cable glows red with no data flowing on it */}
+      <Line
+        points={points}
+        color={isCut ? '#b91c1c' : '#1f5e86'}
+        lineWidth={isCut ? 1.6 : 1}
+        transparent
+        opacity={baseOpacity}
+      />
       <Line
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ref={flowLineRef as any}

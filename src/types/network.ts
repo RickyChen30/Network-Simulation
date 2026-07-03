@@ -51,6 +51,10 @@ export interface NetworkNode {
   ip: string
   // Continent the node sits on (used to group the continent zoom view)
   continent: string
+  // Autonomous system this node routes in. Usually the continent, but a city
+  // whose only uplink crosses continents joins its provider hub's AS (a
+  // single-homed customer). Assigned by NetworkGraph at build time.
+  as?: string
   // 3D position in world space (X = east, Z = south, Y = up)
   position: [number, number, number]
   // Whether this node is currently forwarding traffic (firewall toggle flips datacenters)
@@ -65,6 +69,17 @@ export interface NetworkLink {
   latency: number
   // Relative capacity unit (packets the link can carry comfortably)
   bandwidth: number
+  // A cut submarine cable: physically down until repaired. If it was the last
+  // link between two ASes, the BGP session drops and routes are withdrawn.
+  cut?: boolean
+}
+
+// One row of an AS's BGP table, for the UI: the selected best route toward a
+// destination AS (asPath[0] is the next-hop AS, the last entry is the dest).
+export interface BgpRouteView {
+  destAs: string
+  asPath: string[]
+  nextHopAs: string
 }
 
 // A packet is one segment of a flow. It does NOT carry a pre-computed route:
@@ -139,4 +154,8 @@ export interface SimulationStats {
   protocolMix: Record<Protocol, number>
   routingMode: RoutingMode
   isPaused: boolean
+  // BGP layer: whether updates are still propagating between ASes, and the
+  // human label of the currently cut submarine cable (null = none cut).
+  bgpConverging: boolean
+  cutCable: string | null
 }

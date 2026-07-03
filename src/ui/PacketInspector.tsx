@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { Packet, NetworkNode, Protocol, TcpCongestionInfo } from '../types/network'
 import { PROTOCOL_COLORS } from '../config/topology'
+import { TTL_MAX_HOPS } from '../config/constants'
 
 interface PacketInspectorProps {
   packet: Packet
@@ -106,7 +107,7 @@ export function PacketInspector({ packet, nodeMap, tcp, onClose }: PacketInspect
   currentLatency = Math.round(currentLatency)
 
   const jitter = Math.round(totalLatency * 0.04 + (hashStr(packet.flowId) % 6) + hops.length * 0.4)
-  const ttl = Math.max(1, 64 - packet.pathIndex)
+  const ttl = Math.max(0, TTL_MAX_HOPS - packet.pathIndex)
   const atEnd = packet.pathIndex >= hops.length - 1
   const nextHop = atEnd ? '—' : label(hops[packet.pathIndex + 1])
   const currentHop =
@@ -118,6 +119,20 @@ export function PacketInspector({ packet, nodeMap, tcp, onClose }: PacketInspect
   // Per-hop forwarding: the route past the next hop hasn't been decided yet —
   // each router picks it from its forwarding table when the packet arrives.
   const routeKnown = hops[hops.length - 1] === packet.destinationId
+
+  // The AS sequence this packet has crossed so far (each continent is an AS),
+  // with the destination's AS appended while the route is still unfolding.
+  const asOf = (id: string) => nodeMap.get(id)?.as ?? nodeMap.get(id)?.continent ?? '?'
+  const asSeq: string[] = []
+  for (const h of hops) {
+    const as = asOf(h)
+    if (asSeq[asSeq.length - 1] !== as) asSeq.push(as)
+  }
+  const destAs = asOf(packet.destinationId)
+  const asPathText =
+    asSeq[asSeq.length - 1] === destAs
+      ? asSeq.join(' → ')
+      : `${asSeq.join(' → ')} → ⋯ ${destAs}`
 
   return (
     <div className="absolute right-4 top-4 w-72 max-h-[calc(100vh-2rem)] overflow-y-auto bg-slate-950/85 backdrop-blur-md border border-white/10 rounded-xl p-4 shadow-2xl select-none">
@@ -141,7 +156,7 @@ export function PacketInspector({ packet, nodeMap, tcp, onClose }: PacketInspect
         <Row label="Protocol" value={packet.protocol} color={color} />
         <Row label="Application" value={applicationFor(packet)} />
         <Row label="Size" value={`${packet.size} B`} mono />
-        <Row label="TTL" value={`${ttl} / 64`} mono />
+        <Row label="TTL" value={`${ttl} / ${TTL_MAX_HOPS}`} mono />
         <Row label="Packet ID" value={packet.id} mono />
       </Section>
 
@@ -175,6 +190,7 @@ export function PacketInspector({ packet, nodeMap, tcp, onClose }: PacketInspect
       <Section title="Connection">
         <Row label="Current Hop" value={currentHop} />
         <Row label="Destination" value={label(packet.destinationId)} />
+        <Row label="AS Path" value={asPathText} />
         <Row
           label="Hop Count"
           value={routeKnown ? `${hops.length - 1} hops` : `${hops.length - 1} of ~${packet.expectedHops} hops`}

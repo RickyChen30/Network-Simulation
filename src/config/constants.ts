@@ -31,6 +31,19 @@ export const LINK_SERVICE_FACTOR = 28
 // Packets a router will hold per output port before tail-dropping newcomers.
 export const ROUTER_QUEUE_CAPACITY = 8
 
+// --- BGP / AS layer ----------------------------------------------------------
+// Each continent is an autonomous system. BGP updates between neighboring ASes
+// are not instantaneous: a route change takes a propagation + processing delay
+// per AS hop, and repeated updates on one session are paced by an MRAI timer —
+// so after a cable cut the network visibly re-converges outward over seconds
+// (scaled-down versions of real eBGP dynamics, where MRAI defaults to 30 s).
+export const BGP_UPDATE_DELAY_MS = 700
+export const BGP_UPDATE_JITTER_MS = 400
+export const BGP_MRAI_MS = 1800
+// Data-plane TTL: a packet is dropped after this many hops, so transient
+// forwarding loops during BGP convergence kill packets instead of looping forever.
+export const TTL_MAX_HOPS = 32
+
 // --- Visual sizing per node type -------------------------------------------
 // Marker radius for the glowing pin sitting on the globe surface.
 export const NODE_SIZE: Record<NodeType, number> = {

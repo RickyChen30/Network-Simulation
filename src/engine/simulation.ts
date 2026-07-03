@@ -155,6 +155,7 @@ export class SimulationEngine {
   // so its uplink queues genuinely saturate and overflow.
   private _ddosTargetId: string | null
 
+  private _nowMs: number
   private _completed: number
   private _dropped: number
   private _queueDrops: number
@@ -177,6 +178,7 @@ export class SimulationEngine {
     this._routingMode = 'shortest-path'
     this._isDDoS = false
     this._ddosTargetId = null
+    this._nowMs = 0
     this._completed = 0
     this._dropped = 0
     this._queueDrops = 0
@@ -190,6 +192,11 @@ export class SimulationEngine {
 
   tick(deltaSeconds: number, realTimeMs: number): void {
     if (this._isPaused) return
+    this._nowMs = realTimeMs
+
+    // Deliver due BGP updates first — forwarding tables may change under the
+    // packets already in flight (that's the convergence realism).
+    this.graph.tick(realTimeMs)
 
     this._spawnFlows(deltaSeconds, realTimeMs)
     this._processFlows(realTimeMs)
@@ -620,6 +627,8 @@ export class SimulationEngine {
       protocolMix,
       routingMode: this._routingMode,
       isPaused: this._isPaused,
+      bgpConverging: this.graph.isBgpConverging(),
+      cutCable: this.graph.getCutCableLabel(),
     }
   }
 
@@ -647,6 +656,14 @@ export class SimulationEngine {
 
   toggleFirewall(): void {
     this.graph.toggleFirewall()
+  }
+
+  // Cut a random submarine cable (or repair the one that's cut). Dropping the
+  // last cable between two ASes kills the eBGP session: routes are withdrawn
+  // and re-selected around the break, propagating with realistic delay.
+  toggleCableCut(): void {
+    this.graph.toggleCableCut(this._nowMs)
+    this.onStateChange?.(this._buildStats(), this.packets)
   }
 
   reset(): void {

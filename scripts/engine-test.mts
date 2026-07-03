@@ -191,6 +191,67 @@ console.log(
   `queued seen ${sawQueued}, resumed ${queuedResumed}, shape ${queuedShapeOk ? 'ok' : 'BAD'}, tail drops ${last!.queueDrops}`,
 )
 
+// --- AS / BGP layer ---------------------------------------------------------
+// Each continent is an AS. Verify: the data plane follows BGP AS paths; cutting
+// the sole Asia–Oceania cable drops the session, withdraws routes, and
+// re-converges (with real delay) onto longer AS paths via North America; the
+// repair restores the direct route.
+const g = engine.graph
+const asOf = (id: string) => g.getAsOf(id)!
+const asSeqOf = (route: string[]) => {
+  const seq: string[] = []
+  for (const n of route) {
+    const a = asOf(n)
+    if (seq[seq.length - 1] !== a) seq.push(a)
+  }
+  return seq
+}
+
+const oceaniaHome = g.getHomeIds().find(h => asOf(h) === 'Oceania')!
+const routeBefore = g.getRoute(oceaniaHome, 'srv-sin1')
+const bestBefore = g.bgp.getBest('Oceania', 'Asia')
+const okBgpRouting =
+  !g.isBgpConverging() &&
+  !!routeBefore &&
+  !!bestBefore &&
+  bestBefore.asPath.length === 1 && // direct adjacency over l-sin-syd
+  JSON.stringify(asSeqOf(routeBefore)) === JSON.stringify(['Oceania', ...bestBefore.asPath])
+console.log('\n--- BGP (each continent is an AS) ---')
+console.log('initial     :', `Oceania→Asia path [${bestBefore?.asPath}], data plane ${okBgpRouting ? 'matches' : 'DIVERGES'}`)
+
+// Cut the cable. Withdrawal must NOT be instantaneous: right at the cut,
+// Europe still holds its stale route to Oceania via Asia, and updates are
+// still in flight hundreds of ms later.
+const cutLink = g.cutCable(realMs, 'l-sin-syd')
+const staleEuRoute = g.bgp.getBest('Europe', 'Oceania')
+const convergingAtCut = g.isBgpConverging()
+run(0.3)
+const stillConvergingLater = g.isBgpConverging()
+run(12) // let convergence finish
+const asiaBest = g.bgp.getBest('Asia', 'Oceania')
+const oceaniaBest = g.bgp.getBest('Oceania', 'Asia')
+const euBest = g.bgp.getBest('Europe', 'Oceania')
+const routeAfter = g.getRoute(oceaniaHome, 'srv-sin1')
+const okDelay = convergingAtCut && staleEuRoute?.nextHopAs === 'Asia' && stillConvergingLater && !g.isBgpConverging()
+const okWithdrawal =
+  cutLink?.id === 'l-sin-syd' &&
+  !!asiaBest && asiaBest.asPath.length === 2 && asiaBest.nextHopAs === 'North America' &&
+  !!oceaniaBest && oceaniaBest.nextHopAs === 'North America' &&
+  !!euBest && euBest.nextHopAs === 'North America' &&
+  !!routeAfter && asSeqOf(routeAfter).includes('North America')
+console.log('cable cut   :', `Asia→Oceania now [${asiaBest?.asPath}], route via NA ${!!routeAfter && asSeqOf(routeAfter).includes('North America')}`)
+console.log('convergence :', `delayed ${convergingAtCut && stillConvergingLater}, stale EU route held ${staleEuRoute?.nextHopAs === 'Asia'}, settled ${!g.isBgpConverging()}`)
+
+// Repair: the session re-establishes and the direct route returns.
+g.repairCable(realMs)
+const convergingOnRepair = g.isBgpConverging()
+run(12)
+const okRepair =
+  convergingOnRepair &&
+  !g.isBgpConverging() &&
+  g.bgp.getBest('Oceania', 'Asia')?.asPath.length === 1
+console.log('repair      :', `direct route restored ${g.bgp.getBest('Oceania', 'Asia')?.asPath.length === 1}`)
+
 // Raise the firewall (block the data centers) and confirm new flows fail.
 const droppedBefore = last!.droppedPackets
 engine.toggleFirewall()
@@ -214,9 +275,16 @@ console.log('per-hop forwarding:', okForwarding ? 'PASS' : 'FAIL')
 console.log('tcp congestion    :', okTcpCongestion ? 'PASS' : 'FAIL')
 console.log('loss halves cwnd  :', okLossResponse ? 'PASS' : 'FAIL')
 console.log('router queues     :', okQueues ? 'PASS' : 'FAIL')
+console.log('bgp as-path fib   :', okBgpRouting ? 'PASS' : 'FAIL')
+console.log('bgp withdrawal    :', okWithdrawal ? 'PASS' : 'FAIL')
+console.log('bgp convergence   :', okDelay ? 'PASS' : 'FAIL')
+console.log('bgp repair        :', okRepair ? 'PASS' : 'FAIL')
 console.log('firewall blocks   :', okFirewall ? 'PASS' : 'FAIL')
 console.log('reset clears state:', okReset ? 'PASS' : 'FAIL')
 
-if (!okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okQueues || !okFirewall || !okReset)
+if (
+  !okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okQueues ||
+  !okBgpRouting || !okWithdrawal || !okDelay || !okRepair || !okFirewall || !okReset
+)
   process.exit(1)
 console.log('\nALL CHECKS PASSED')
