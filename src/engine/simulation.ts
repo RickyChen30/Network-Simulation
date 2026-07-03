@@ -171,6 +171,10 @@ export class SimulationEngine {
   private _lingerTimers: Map<string, number>
   // Per-city resolver cache: "srcId>dstId" → sim time (ms) the entry expires.
   private _dnsCache: Map<string, number>
+  // Alive-packet index so flow bookkeeping doesn't scan the whole packet array
+  // per flow per tick: flowId → alive count, and flowId → seq → alive count.
+  private _aliveByFlow: Map<string, number>
+  private _aliveSeqs: Map<string, Map<number, number>>
 
   onStateChange?: (stats: SimulationStats, packets: Packet[]) => void
 
@@ -194,6 +198,35 @@ export class SimulationEngine {
     this._spawnAccumulator = 0
     this._lingerTimers = new Map()
     this._dnsCache = new Map()
+    this._aliveByFlow = new Map()
+    this._aliveSeqs = new Map()
+  }
+
+  private _aliveInc(p: Packet): void {
+    this._aliveByFlow.set(p.flowId, (this._aliveByFlow.get(p.flowId) ?? 0) + 1)
+    if (p.seq === undefined) return
+    let seqs = this._aliveSeqs.get(p.flowId)
+    if (!seqs) {
+      seqs = new Map()
+      this._aliveSeqs.set(p.flowId, seqs)
+    }
+    seqs.set(p.seq, (seqs.get(p.seq) ?? 0) + 1)
+  }
+
+  private _aliveDec(p: Packet): void {
+    const count = this._aliveByFlow.get(p.flowId)
+    if (count !== undefined) {
+      if (count <= 1) this._aliveByFlow.delete(p.flowId)
+      else this._aliveByFlow.set(p.flowId, count - 1)
+    }
+    if (p.seq === undefined) return
+    const seqs = this._aliveSeqs.get(p.flowId)
+    const seqCount = seqs?.get(p.seq)
+    if (seqs && seqCount !== undefined) {
+      if (seqCount <= 1) seqs.delete(p.seq)
+      else seqs.set(p.seq, seqCount - 1)
+      if (seqs.size === 0) this._aliveSeqs.delete(p.flowId)
+    }
   }
 
   tick(deltaSeconds: number, realTimeMs: number): void {
@@ -224,7 +257,7 @@ export class SimulationEngine {
   }
 
   private _hasInflight(flowId: string): boolean {
-    return this.packets.some(p => p.flowId === flowId && this._isAlive(p))
+    return (this._aliveByFlow.get(flowId) ?? 0) > 0
   }
 
   private _spawnFlows(deltaSeconds: number, now: number): void {
@@ -397,6 +430,7 @@ export class SimulationEngine {
       this._queueDrops++
       this._lingerTimers.set(packet.id, now + 200)
     }
+    if (this._isAlive(packet)) this._aliveInc(packet)
     return packet
   }
 
@@ -410,9 +444,7 @@ export class SimulationEngine {
     // DATA or its returning ACK) are no longer in flight was lost somewhere.
     for (const [seq, seg] of tcp.inFlight) {
       if (now - seg.sentAt <= TCP_TIMEOUT_MS) continue
-      const stillFlying = this.packets.some(
-        p => p.flowId === flow.id && p.seq === seq && this._isAlive(p),
-      )
+      const stillFlying = (this._aliveSeqs.get(flow.id)?.get(seq) ?? 0) > 0
       if (stillFlying) continue
 
       if (seg.retx >= MAX_RETX) {
@@ -535,9 +567,11 @@ export class SimulationEngine {
       if (packet.status !== 'in-flight') continue
       const result = stepPacket(packet, deltaSeconds, ctx, this.graph.links)
       if (result === 'delivered') {
+        this._aliveDec(packet)
         this._onDelivered(packet, realTimeMs)
         this._lingerTimers.set(packet.id, realTimeMs + PACKET_LINGER_MS)
       } else if (result === 'dropped') {
+        this._aliveDec(packet)
         this._dropped++
         this._lingerTimers.set(packet.id, realTimeMs + 200)
       }
@@ -690,6 +724,8 @@ export class SimulationEngine {
     this._spawnAccumulator = 0
     this._lingerTimers.clear()
     this._dnsCache.clear()
+    this._aliveByFlow.clear()
+    this._aliveSeqs.clear()
     this._isPaused = false
     this._routingMode = 'shortest-path'
     this._isDDoS = false

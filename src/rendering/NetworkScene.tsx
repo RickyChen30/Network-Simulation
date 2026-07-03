@@ -10,6 +10,7 @@ import { getPacketWorldPosition } from '../engine/packet'
 import { NodeMesh } from './NodeMesh'
 import { LinkMesh } from './LinkMesh'
 import { PacketMesh } from './PacketMesh'
+import { PacketInstances } from './PacketInstances'
 import { Globe } from './Globe'
 import { CityDetail } from './CityDetail'
 import { CAMERA_POSITION, CAMERA_TARGET } from '../config/constants'
@@ -275,6 +276,13 @@ export function NetworkScene({
 
   const packets = engine.packets
   const positionCache = engine.getPositionCache()
+  // The packet currently being ridden (if any) — the only one that gets a
+  // full per-packet component with the drei Trail and halo.
+  const followedPacket = selectedFlowId
+    ? packets.find(
+        p => p.flowId === selectedFlowId && (p.status === 'in-flight' || p.status === 'queued'),
+      )
+    : undefined
 
   return (
     <>
@@ -355,15 +363,21 @@ export function NetworkScene({
           />
         ))}
 
-      {packets.map(packet => (
+      {/* All packets in three instanced draw calls (bodies, tails, hit layer)
+          — positions stream straight from engine state every frame, so packet
+          count doesn't grow the React tree or the draw-call count. */}
+      <PacketInstances engine={engine} onSelect={onSelectPacket} />
+
+      {/* The ridden packet keeps the fancy per-packet comet trail + halo. */}
+      {followedPacket && (
         <PacketMesh
-          key={packet.id}
-          packet={packet}
+          key={followedPacket.id}
+          packet={followedPacket}
           positionCache={positionCache}
-          selected={packet.flowId === selectedFlowId}
+          selected
           onSelect={onSelectPacket}
         />
-      ))}
+      )}
 
       {/* Post-processing: bloom + vignette */}
       <EffectComposer>
