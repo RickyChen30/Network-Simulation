@@ -89,6 +89,10 @@ const DDOS_SPAWN_MULTIPLIER = 6
 // How long a resolved name stays in a city's DNS cache — flows from that city
 // to the same server within the TTL skip the lookup.
 const DNS_TTL_MS = 45_000
+// How often engine state is pushed to React (HUD, inspector). Rendering reads
+// live engine state every frame regardless — pushing at 60 Hz only forced the
+// whole React tree through reconciliation per frame for no visual gain.
+const STATS_PUSH_INTERVAL_MS = 125
 
 // Realistic per-link packet-loss probability, driven by link quality: fiber
 // backbone and subsea cables are near-lossless; access / last-mile links lose a
@@ -156,6 +160,7 @@ export class SimulationEngine {
   private _ddosTargetId: string | null
 
   private _nowMs: number
+  private _lastStatsPush: number
   private _completed: number
   private _dropped: number
   private _queueDrops: number
@@ -179,6 +184,7 @@ export class SimulationEngine {
     this._isDDoS = false
     this._ddosTargetId = null
     this._nowMs = 0
+    this._lastStatsPush = -Infinity
     this._completed = 0
     this._dropped = 0
     this._queueDrops = 0
@@ -205,7 +211,11 @@ export class SimulationEngine {
     this._pruneLingeredPackets(realTimeMs)
     this._pruneFlows()
 
-    this.onStateChange?.(this._buildStats(), this.packets)
+    // Throttled: user actions (pause, reset, toggles) still push immediately.
+    if (realTimeMs - this._lastStatsPush >= STATS_PUSH_INTERVAL_MS) {
+      this._lastStatsPush = realTimeMs
+      this.onStateChange?.(this._buildStats(), this.packets)
+    }
   }
 
   // A packet parked in a router queue is still "alive" for flow bookkeeping.
@@ -684,6 +694,7 @@ export class SimulationEngine {
     this._routingMode = 'shortest-path'
     this._isDDoS = false
     this._ddosTargetId = null
+    this._lastStatsPush = -Infinity
     resetPacketCounter()
     this.onStateChange?.(this._buildStats(), this.packets)
   }

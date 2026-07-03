@@ -1,4 +1,4 @@
-import { useMemo, useRef } from 'react'
+import { memo, useMemo, useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
 import { Line } from '@react-three/drei'
 import * as THREE from 'three'
@@ -7,15 +7,20 @@ import { arcPoint } from '../config/globe'
 
 interface LinkMeshProps {
   link: NetworkLink
-  nodes: NetworkNode[]
+  source: NetworkNode | undefined
+  target: NetworkNode | undefined
+  // Passed as scalars (not read off the mutated link/node objects) so the
+  // memoized component re-renders exactly when they change.
+  active: boolean
+  cut: boolean
 }
 
 // A network link drawn as a lifted great-circle arc between two cities — the
 // way submarine and terrestrial cables span the globe. A faint solid arc shows
 // the route; an animated dashed overlay suggests live data flowing along it.
-export function LinkMesh({ link, nodes }: LinkMeshProps) {
-  const source = nodes.find(n => n.id === link.sourceId)
-  const target = nodes.find(n => n.id === link.targetId)
+// Memoized: the scene re-renders on every HUD update, but a link only changes
+// when it's cut or an endpoint goes down.
+export const LinkMesh = memo(function LinkMesh({ link, source, target, active, cut }: LinkMeshProps) {
   const flowLineRef = useRef<{ material: { dashOffset: number } } | null>(null)
 
   const points = useMemo<THREE.Vector3[]>(() => {
@@ -36,8 +41,8 @@ export function LinkMesh({ link, nodes }: LinkMeshProps) {
 
   if (points.length < 2 || !source || !target) return null
 
-  const isCut = link.cut === true
-  const isActive = source.active && target.active && !isCut
+  const isCut = cut
+  const isActive = active && !isCut
   const baseOpacity = isCut ? 0.45 : isActive ? 0.18 : 0.04
   const flowOpacity = isActive ? 0.55 : 0
 
@@ -65,4 +70,4 @@ export function LinkMesh({ link, nodes }: LinkMeshProps) {
       />
     </group>
   )
-}
+})

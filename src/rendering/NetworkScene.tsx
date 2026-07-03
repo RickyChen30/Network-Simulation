@@ -323,9 +323,20 @@ export function NetworkScene({
         ))}
 
       {/* Cable arcs first, then city markers on top */}
-      {links.map(link => (
-        <LinkMesh key={link.id} link={link} nodes={nodes} />
-      ))}
+      {links.map(link => {
+        const source = nodeMap.get(link.sourceId)
+        const target = nodeMap.get(link.targetId)
+        return (
+          <LinkMesh
+            key={link.id}
+            link={link}
+            source={source}
+            target={target}
+            active={!!source?.active && !!target?.active}
+            cut={link.cut === true}
+          />
+        )
+      })}
 
       {/* City markers — de-duplicated so each metro shows one point. Hidden for
           the focused city (city view) or the whole continent (continent view),
@@ -338,6 +349,7 @@ export function NetworkScene({
           <NodeMesh
             key={node.id}
             node={node}
+            active={node.active}
             showLabel={!focusedId && !selectedFlowId}
             onFocus={onFocus}
           />

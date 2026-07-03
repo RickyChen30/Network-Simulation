@@ -1,4 +1,4 @@
-import { useRef, useMemo } from 'react'
+import { memo, useRef, useMemo } from 'react'
 import { useFrame } from '@react-three/fiber'
 import { Html } from '@react-three/drei'
 import * as THREE from 'three'
@@ -8,6 +8,9 @@ import { NODE_SIZE, NODE_GLOW } from '../config/constants'
 
 interface NodeMeshProps {
   node: NetworkNode
+  // Scalar mirror of node.active (the node object mutates in place), so the
+  // memoized component re-renders exactly when the firewall flips it.
+  active: boolean
   showLabel: boolean
   onFocus: (id: string) => void
 }
@@ -16,15 +19,17 @@ interface NodeMeshProps {
 // clickable label offset radially outward. Clicking the marker or its label
 // flies the camera into that city. The label fades out when the city rotates to
 // the far side of the globe so it never shows through the planet.
-export function NodeMesh({ node, showLabel, onFocus }: NodeMeshProps) {
+// Memoized: markers only change when the firewall or label visibility flips,
+// not on every HUD update.
+export const NodeMesh = memo(function NodeMesh({ node, active, showLabel, onFocus }: NodeMeshProps) {
   const haloRef = useRef<THREE.Mesh>(null)
   const labelRef = useRef<HTMLDivElement>(null)
 
   const color = NODE_COLORS[node.type]
   const size = NODE_SIZE[node.type]
   const glow = NODE_GLOW[node.type]
-  const opacity = node.active ? 1 : 0.2
-  const labelOpacity = node.active ? 0.95 : 0.45
+  const opacity = active ? 1 : 0.2
+  const labelOpacity = active ? 0.95 : 0.45
 
   // Surface-normal direction (node sits on a sphere centered at the origin).
   const normal = useMemo<[number, number, number]>(() => {
@@ -107,4 +112,4 @@ export function NodeMesh({ node, showLabel, onFocus }: NodeMeshProps) {
       )}
     </group>
   )
-}
+})
