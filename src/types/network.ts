@@ -32,6 +32,7 @@ export type Segment =
   | 'FIN'
   | 'FIN-ACK'
   | 'RETX' // a TCP retransmission after a lost segment
+  | 'RST' // a TCP reset (connection refused / abort)
   | 'DATAGRAM' // UDP
   | 'ECHO' // ICMP request
   | 'REPLY' // ICMP reply
@@ -121,6 +122,14 @@ export interface Packet {
   // TCP sequence number for DATA segments (and the ack number the matching
   // DATA-ACK carries back). Undefined for non-data traffic.
   seq?: number
+  // --- Real TCP segment header fields (per-endpoint stack; see
+  // docs/tcp-endpoints-plan.md). Undefined for legacy flow-model traffic. ---
+  ackNo?: number // cumulative acknowledgement (next byte the sender expects)
+  tcpFlags?: number // SYN|ACK|FIN|RST|PSH bitmask
+  window?: number // advertised receive window in bytes (flow control)
+  payloadLen?: number // application bytes this segment carries
+  checksum?: number // Internet checksum over pseudo-header + segment
+  corrupt?: boolean // set by the optional per-link bit-error impairment
 }
 
 // --- TCP congestion control --------------------------------------------------

@@ -43,7 +43,7 @@ function takeHop(packet: Packet, b: string, links: NetworkLink[]): void {
 
 // Control segments (handshake / ack / teardown) carry no payload.
 const CONTROL_SEGMENTS = new Set<Segment>([
-  'SYN', 'SYN-ACK', 'ACK', 'DATA-ACK', 'FIN', 'FIN-ACK',
+  'SYN', 'SYN-ACK', 'ACK', 'DATA-ACK', 'FIN', 'FIN-ACK', 'RST',
 ])
 
 // Realistic packet sizes (bytes): control packets are tiny, data is MTU-ish.
@@ -73,6 +73,13 @@ export interface CreatePacketArgs {
   lossProb: number
   lossAt?: number | null
   seq?: number
+  // Real TCP segment header fields (per-endpoint stack). Optional so legacy
+  // flow-model callers are unaffected.
+  ackNo?: number
+  tcpFlags?: number
+  window?: number
+  payloadLen?: number
+  checksum?: number
 }
 
 export function createPacket(args: CreatePacketArgs): Packet {
@@ -103,6 +110,11 @@ export function createPacket(args: CreatePacketArgs): Packet {
     hopLatencies: [],
     bottleneckBw: Infinity,
     seq: args.seq,
+    ackNo: args.ackNo,
+    tcpFlags: args.tcpFlags,
+    window: args.window,
+    payloadLen: args.payloadLen,
+    checksum: args.checksum,
   }
   takeHop(packet, args.firstHopId, args.links)
   return packet

@@ -2,6 +2,43 @@
 // Drives the engine manually since there's no requestAnimationFrame in Node.
 import { SimulationEngine } from '../src/engine/simulation'
 import type { SimulationStats } from '../src/types/network'
+import { seqLt, seqGt, seqAdd, seqDiff } from '../src/engine/tcp/seq'
+import { Reasm } from '../src/engine/tcp/reasm'
+
+// --- TCP scaffold unit checks (Milestone 1) ---------------------------------
+// The trickiest primitives of the per-endpoint stack are pure and testable now.
+let seqOk = true
+seqOk &&= seqLt(1, 2) && seqGt(2, 1)
+seqOk &&= seqLt(0xffffffff, 0) && seqGt(0, 0xffffffff) // wraparound: FFFFFFFF precedes 0
+seqOk &&= seqAdd(0xffffffff, 1) === 0
+seqOk &&= seqDiff(5, 2) === 3 && seqDiff(2, 5) === -3
+
+let reasmOk = true
+{
+  // In-order data advances the boundary and leaves no gaps.
+  const r = new Reasm()
+  r.insert(100, 10)
+  reasmOk &&= r.advance(100) === 110 && !r.hasGaps()
+
+  // A gap is held until the missing range fills, then both are absorbed.
+  const g = new Reasm()
+  g.insert(110, 10) // arrives before [100,110)
+  reasmOk &&= g.advance(100) === 100 && g.hasGaps()
+  g.insert(100, 10)
+  reasmOk &&= g.advance(100) === 120 && !g.hasGaps()
+
+  // Overlapping/duplicate ranges coalesce; data fully below the boundary drops.
+  const o = new Reasm()
+  o.insert(100, 10)
+  o.insert(105, 10) // overlaps → merges to [100,115)
+  reasmOk &&= o.advance(100) === 115
+  const d = new Reasm()
+  d.insert(100, 10)
+  reasmOk &&= d.advance(120) === 120 && !d.hasGaps() // pure duplicate discarded
+}
+console.log('--- TCP scaffold (Milestone 1) ---')
+console.log('seq arithmetic :', seqOk ? 'PASS' : 'FAIL')
+console.log('reassembly     :', reasmOk ? 'PASS' : 'FAIL')
 
 const engine = new SimulationEngine()
 let last: SimulationStats | null = null
@@ -283,6 +320,7 @@ console.log('firewall blocks   :', okFirewall ? 'PASS' : 'FAIL')
 console.log('reset clears state:', okReset ? 'PASS' : 'FAIL')
 
 if (
+  !seqOk || !reasmOk ||
   !okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okQueues ||
   !okBgpRouting || !okWithdrawal || !okDelay || !okRepair || !okFirewall || !okReset
 )

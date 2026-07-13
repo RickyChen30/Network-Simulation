@@ -11,6 +11,8 @@ import { NetworkGraph } from './network'
 import { computePathLatency } from './routing'
 import { createPacket, resetPacketCounter, stepPacket, type ForwardingContext } from './packet'
 import { LinkScheduler } from './queues'
+import { TcpEndpoint } from './tcp/endpoint'
+import { PORT_HTTP, PORT_HTTPS } from './tcp/tcp-const'
 import { MAX_ACTIVE_PACKETS, PACKET_LINGER_MS, LATENCY_WINDOW } from '../config/constants'
 
 // --- Flow model ------------------------------------------------------------
@@ -146,12 +148,37 @@ function buildSteps(protocol: Protocol): FlowStep[] {
   return steps
 }
 
+// Arguments for _injectSegment — the shared "put one segment on the wire" call.
+// The TCP header fields are optional so legacy flow-model traffic omits them.
+interface InjectArgs {
+  protocol: Protocol
+  segment: Segment
+  sourceId: string
+  destinationId: string
+  srcPort: number
+  dstPort: number
+  simulationTimeMs: number
+  lossProb: number
+  flowId?: string
+  expectedHops?: number // omit to trace it live via the forwarding tables
+  lossAt?: number | null
+  seq?: number
+  ackNo?: number
+  tcpFlags?: number
+  window?: number
+  payloadLen?: number
+  checksum?: number
+}
+
 export class SimulationEngine {
   graph: NetworkGraph
   packets: Packet[]
 
   private _flows: Flow[]
   private _scheduler: LinkScheduler
+  // Per-host TCP endpoints (home + server nodes). Built here and left inert
+  // until Milestone 2 wires delivery + tick; see docs/tcp-endpoints-plan.md.
+  private _endpoints: Map<string, TcpEndpoint>
   private _isPaused: boolean
   private _routingMode: RoutingMode
   private _isDDoS: boolean
@@ -200,6 +227,26 @@ export class SimulationEngine {
     this._dnsCache = new Map()
     this._aliveByFlow = new Map()
     this._aliveSeqs = new Map()
+    this._endpoints = this._buildEndpoints()
+  }
+
+  // Give every host node (traffic source or server) a TCP endpoint. Servers
+  // listen on the well-known web ports. Inert until Milestone 2.
+  private _buildEndpoints(): Map<string, TcpEndpoint> {
+    const eps = new Map<string, TcpEndpoint>()
+    for (const id of this.graph.getHomeIds()) eps.set(id, new TcpEndpoint(id))
+    for (const id of this.graph.getServerIds()) {
+      const ep = new TcpEndpoint(id)
+      ep.listen(PORT_HTTP)
+      ep.listen(PORT_HTTPS)
+      eps.set(id, ep)
+    }
+    return eps
+  }
+
+  /** The TCP endpoint hosted on a node, if it is a host (home/server). */
+  getTcpEndpoint(nodeId: string): TcpEndpoint | undefined {
+    return this._endpoints.get(nodeId)
   }
 
   private _aliveInc(p: Packet): void {
@@ -381,6 +428,64 @@ export class SimulationEngine {
     return 1 - survive
   }
 
+  // Inject one segment into the simulated network: pick the source's first hop,
+  // build the Packet, and hand it to the local uplink's output queue. Shared by
+  // the legacy flow model (via _emit) and, from Milestone 2 on, the per-endpoint
+  // TCP stack. Returns the Packet, or null if the source has no route (which the
+  // caller treats as a send failure — counted as a drop).
+  private _injectSegment(a: InjectArgs): Packet | null {
+    // The sending host makes only the first routing decision; every later hop is
+    // chosen by the router the packet lands on. No route (e.g. firewall raised
+    // mid-flow) → the send fails outright and the sender's timer retries.
+    const firstHopId = this.graph.getNextHop(a.sourceId, a.destinationId)
+    if (firstHopId === null) {
+      this._dropped++
+      return null
+    }
+    let expectedHops = a.expectedHops
+    if (expectedHops === undefined) {
+      const route = this.graph.getRoute(a.sourceId, a.destinationId)
+      expectedHops = route ? route.length - 1 : 1
+    }
+
+    const packet = createPacket({
+      flowId: a.flowId ?? '',
+      protocol: a.protocol,
+      segment: a.segment,
+      sourceId: a.sourceId,
+      destinationId: a.destinationId,
+      srcPort: a.srcPort,
+      dstPort: a.dstPort,
+      firstHopId,
+      expectedHops,
+      links: this.graph.links,
+      simulationTimeMs: a.simulationTimeMs,
+      lossProb: a.lossProb,
+      lossAt: a.lossAt,
+      seq: a.seq,
+      ackNo: a.ackNo,
+      tcpFlags: a.tcpFlags,
+      window: a.window,
+      payloadLen: a.payloadLen,
+      checksum: a.checksum,
+    })
+    this.packets.push(packet)
+
+    // The sending host contends for its own uplink like everyone else: the
+    // packet may go straight out, sit in the local queue, or be tail-dropped.
+    const slot = this._scheduler.send(packet, a.sourceId, firstHopId, a.simulationTimeMs)
+    if (slot === 'queued') {
+      packet.status = 'queued'
+    } else if (slot === 'dropped') {
+      packet.status = 'dropped'
+      this._dropped++
+      this._queueDrops++
+      this._lingerTimers.set(packet.id, a.simulationTimeMs + 200)
+    }
+    if (this._isAlive(packet)) this._aliveInc(packet)
+    return packet
+  }
+
   private _emit(flow: Flow, step: FlowStep, now: number, retx: boolean, seq?: number): Packet | null {
     const dns = step.phase === 'dns'
     const path = dns
@@ -389,48 +494,21 @@ export class SimulationEngine {
     const baseLoss = dns ? flow.dnsLossProb : flow.lossProb
     const lossAt = Math.random() < baseLoss ? 0.3 + Math.random() * 0.5 : null
 
-    // The sending host makes only the first routing decision; every later hop
-    // is chosen by the router the packet lands on. No route at the source
-    // (e.g. firewall raised mid-flow) → the send fails outright, and TCP's
-    // retransmit timer will retry / give up as usual.
-    const destinationId = path[path.length - 1]
-    const firstHopId = this.graph.getNextHop(path[0], destinationId)
-    if (firstHopId === null) {
-      this._dropped++
-      return null
-    }
-
-    const packet = createPacket({
+    const packet = this._injectSegment({
       flowId: flow.id,
       protocol: dns ? 'UDP' : flow.protocol, // DNS rides UDP whatever the flow is
       segment: retx ? 'RETX' : step.segment,
       sourceId: path[0],
-      destinationId,
+      destinationId: path[path.length - 1],
       srcPort: flow.srcPort,
       dstPort: dns ? 53 : flow.dstPort,
-      firstHopId,
       expectedHops: path.length - 1,
-      links: this.graph.links,
       simulationTimeMs: now,
       lossProb: baseLoss,
       lossAt,
       seq,
     })
-    this.packets.push(packet)
-    if (step.wait) flow.awaitingPacketId = packet.id
-
-    // The sending host contends for its own uplink like everyone else: the
-    // packet may go straight out, sit in the local queue, or be tail-dropped.
-    const slot = this._scheduler.send(packet, path[0], firstHopId, now)
-    if (slot === 'queued') {
-      packet.status = 'queued'
-    } else if (slot === 'dropped') {
-      packet.status = 'dropped'
-      this._dropped++
-      this._queueDrops++
-      this._lingerTimers.set(packet.id, now + 200)
-    }
-    if (this._isAlive(packet)) this._aliveInc(packet)
+    if (packet && step.wait) flow.awaitingPacketId = packet.id
     return packet
   }
 
@@ -726,6 +804,7 @@ export class SimulationEngine {
     this._dnsCache.clear()
     this._aliveByFlow.clear()
     this._aliveSeqs.clear()
+    this._endpoints = this._buildEndpoints()
     this._isPaused = false
     this._routingMode = 'shortest-path'
     this._isDDoS = false
