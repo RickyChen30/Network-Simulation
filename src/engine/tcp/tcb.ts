@@ -66,6 +66,7 @@ export interface Tcb {
   iss: number
   sndUna: number // oldest unacknowledged byte
   sndNxt: number // next byte to send
+  sndMax: number // highest byte ever sent (distinguishes new data from resends)
   writeSeq: number // next byte the app will hand to TCP (end of send buffer)
   sndWnd: number // peer's advertised window (flow control limit)
 
@@ -102,12 +103,16 @@ export interface Tcb {
 
   // Application intent.
   appToSend: number // bytes the app still wants TCP to deliver
+  synSent: boolean // the initial SYN / SYN-ACK has been put on the wire
   finRequested: boolean
+  finSent: boolean
   finSeq: number
   retxCount: number
 
-  // Verification: bytes actually delivered in order to the receiving app.
+  // Verification: bytes delivered in order to the receiving app, plus a rolling
+  // hash of their (regenerated) contents — proves byte-exact, in-order delivery.
   bytesDelivered: number
+  deliverHash: number
 
   done: boolean
 }
@@ -133,6 +138,7 @@ export function createTcb(a: CreateTcbArgs): Tcb {
     iss,
     sndUna: iss,
     sndNxt: iss,
+    sndMax: iss,
     writeSeq: iss,
     sndWnd: INIT_CWND, // provisional until the peer advertises its window
 
@@ -163,14 +169,31 @@ export function createTcb(a: CreateTcbArgs): Tcb {
     inflight: new Map(),
 
     appToSend: 0,
+    synSent: false,
     finRequested: false,
+    finSent: false,
     finSeq: 0,
     retxCount: 0,
 
     bytesDelivered: 0,
+    deliverHash: STREAM_HASH_INIT,
 
     done: false,
   }
+}
+
+// Deterministic "application" byte stream: the value of byte `i` (0-based from
+// the start of the data) is a pure function of its offset. The sender need not
+// store any bytes, and the receiver can regenerate and verify what it delivers.
+export function genByte(i: number): number {
+  return ((i * 2654435761) >>> 0) >>> 24 & 0xff
+}
+
+// Rolling hash the receiver folds over each in-order byte it delivers. A test
+// folds the same over indices 0..N-1 to assert byte-exact, in-order delivery.
+export const STREAM_HASH_INIT = 2166136261
+export function foldStreamHash(hash: number, index: number): number {
+  return (Math.imul(hash, 31) + genByte(index)) >>> 0
 }
 
 // The bytes still buffered but unsent: [sndNxt, writeSeq).

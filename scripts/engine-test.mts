@@ -4,6 +4,7 @@ import { SimulationEngine } from '../src/engine/simulation'
 import type { SimulationStats } from '../src/types/network'
 import { seqLt, seqGt, seqAdd, seqDiff } from '../src/engine/tcp/seq'
 import { Reasm } from '../src/engine/tcp/reasm'
+import { STREAM_HASH_INIT, foldStreamHash } from '../src/engine/tcp/tcb'
 
 // --- TCP scaffold unit checks (Milestone 1) ---------------------------------
 // The trickiest primitives of the per-endpoint stack are pure and testable now.
@@ -304,6 +305,45 @@ run(0)
 const okReset =
   last!.completed === 0 && last!.droppedPackets === 0 && last!.connections === 0 && last!.dnsLookups === 0
 
+// --- Milestone 2: one real per-endpoint TCP connection ----------------------
+// A genuine TCP stack on the client host opens a connection to a server,
+// transfers a byte stream over the simulated network (handshake → windowed data
+// → teardown), and the receiver verifies it byte-for-byte via the rolling hash.
+const t2 = new SimulationEngine()
+const XFER = 48 * 1024
+let clientNode = ''
+let serverNode = ''
+for (const h of t2.graph.getHomeIds()) {
+  for (const s of t2.graph.getServerIds()) {
+    if (t2.graph.getRoute(h, s)) { clientNode = h; serverNode = s; break }
+  }
+  if (clientNode) break
+}
+t2.appConnect(clientNode, serverNode, 443, XFER)
+{
+  const dt2 = 1 / 60
+  let ms2 = 0
+  for (let i = 0; i < Math.round(60 / dt2); i++) { ms2 += dt2 * 1000; t2.tick(dt2, ms2) }
+}
+const clientTcb = [...(t2.getTcpEndpoint(clientNode)?.conns.values() ?? [])][0]
+const serverTcb = [...(t2.getTcpEndpoint(serverNode)?.conns.values() ?? [])][0]
+
+let expHash = STREAM_HASH_INIT
+for (let i = 0; i < XFER; i++) expHash = foldStreamHash(expHash, i)
+
+const okByteExact = !!serverTcb && serverTcb.bytesDelivered === XFER && serverTcb.deliverHash === expHash
+const okTeardown =
+  !!clientTcb && !!serverTcb &&
+  (clientTcb.state === 'CLOSED' || clientTcb.state === 'TIME_WAIT') &&
+  serverTcb.state === 'CLOSED'
+const okM2 = okByteExact && okTeardown
+console.log('\n--- Milestone 2: real per-endpoint TCP ---')
+console.log('path        :', `${clientNode} → ${serverNode}`)
+console.log('transfer    :', serverTcb
+  ? `${serverTcb.bytesDelivered}/${XFER} B, hash ${serverTcb.deliverHash === expHash ? 'match' : 'MISMATCH'}`
+  : '(no server connection)')
+console.log('teardown    :', `client ${clientTcb?.state ?? '-'}, server ${serverTcb?.state ?? '-'}`)
+
 console.log('\n--- Results ---')
 console.log('flows complete    :', okNormal ? 'PASS' : 'FAIL')
 console.log('tcp handshake seen:', sawHandshake || protocolsSeen >= 0 ? 'PASS' : 'FAIL')
@@ -318,11 +358,13 @@ console.log('bgp convergence   :', okDelay ? 'PASS' : 'FAIL')
 console.log('bgp repair        :', okRepair ? 'PASS' : 'FAIL')
 console.log('firewall blocks   :', okFirewall ? 'PASS' : 'FAIL')
 console.log('reset clears state:', okReset ? 'PASS' : 'FAIL')
+console.log('tcp byte-exact    :', okByteExact ? 'PASS' : 'FAIL')
+console.log('tcp teardown      :', okTeardown ? 'PASS' : 'FAIL')
 
 if (
   !seqOk || !reasmOk ||
   !okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okQueues ||
-  !okBgpRouting || !okWithdrawal || !okDelay || !okRepair || !okFirewall || !okReset
+  !okBgpRouting || !okWithdrawal || !okDelay || !okRepair || !okFirewall || !okReset || !okM2
 )
   process.exit(1)
 console.log('\nALL CHECKS PASSED')

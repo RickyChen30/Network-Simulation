@@ -21,9 +21,11 @@ export const SND_BUF = 64 * 1024
 export const RCV_BUF = 64 * 1024
 
 // Retransmission timeout bounds and initial value (ms of sim time).
-export const RTO_MIN = 200
+// Simulated per-hop travel is 0.14–0.55 s, so RTTs run to several seconds — the
+// initial RTO is generous and then RTT estimation (below) adapts it per path.
+export const RTO_MIN = 400
 export const RTO_MAX = 60_000
-export const RTO_INIT = 1000
+export const RTO_INIT = 3000
 
 // Karn/Jacobson RTT estimator gains.
 export const RTT_ALPHA = 0.125 // srtt   = (1-a)·srtt + a·sample

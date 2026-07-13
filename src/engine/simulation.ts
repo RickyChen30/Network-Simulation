@@ -12,6 +12,7 @@ import { computePathLatency } from './routing'
 import { createPacket, resetPacketCounter, stepPacket, type ForwardingContext } from './packet'
 import { LinkScheduler } from './queues'
 import { TcpEndpoint } from './tcp/endpoint'
+import { flagsToLabel, type TcpCtx, type OutSegment } from './tcp/tcb'
 import { PORT_HTTP, PORT_HTTPS } from './tcp/tcp-const'
 import { MAX_ACTIVE_PACKETS, PACKET_LINGER_MS, LATENCY_WINDOW } from '../config/constants'
 
@@ -286,6 +287,7 @@ export class SimulationEngine {
 
     this._spawnFlows(deltaSeconds, realTimeMs)
     this._processFlows(realTimeMs)
+    this._tickEndpoints(realTimeMs)
     this._drainQueues(realTimeMs)
     this._stepPackets(deltaSeconds, realTimeMs)
     this._pruneLingeredPackets(realTimeMs)
@@ -428,11 +430,66 @@ export class SimulationEngine {
     return 1 - survive
   }
 
+  // --- Per-endpoint TCP wiring (Milestone 2) --------------------------------
+
+  // Open a real TCP connection from a host node to a server:port, with an app
+  // that will send `bytes` bytes and then close. Returns false if the source is
+  // not a host endpoint. (Drives one connection for now; the live spawner is
+  // cut over to endpoints in a later milestone.)
+  appConnect(srcId: string, dstId: string, port: number, bytes: number): boolean {
+    const ep = this._endpoints.get(srcId)
+    if (!ep) return false
+    ep.connect(dstId, port, bytes)
+    return true
+  }
+
+  // Run every endpoint's timers + sender for this tick.
+  private _tickEndpoints(now: number): void {
+    const ctx = this._tcpCtx(now)
+    for (const ep of this._endpoints.values()) ep.tick(ctx)
+  }
+
+  // The seam the endpoints use to reach the network (routing + segment inject).
+  private _tcpCtx(now: number): TcpCtx {
+    return {
+      now,
+      nextHop: (from, to) => this.graph.getNextHop(from, to),
+      route: (from, to) => this.graph.getRoute(from, to),
+      links: this.graph.links,
+      inject: seg => this._injectTcpSegment(seg, now),
+    }
+  }
+
+  // Turn one endpoint OutSegment into a Packet on the wire, rolling per-path loss
+  // so real segments can drop (and be retransmitted) like legacy traffic.
+  private _injectTcpSegment(seg: OutSegment, now: number): void {
+    const route = this.graph.getRoute(seg.srcNode, seg.dstNode)
+    const lossProb = route ? this._pathLossProb(route) : 0
+    const lossAt = Math.random() < lossProb ? 0.3 + Math.random() * 0.5 : null
+    const hasData = seg.payloadLen > 0
+    this._injectSegment({
+      protocol: 'TCP',
+      segment: flagsToLabel(seg.flags, hasData, false),
+      sourceId: seg.srcNode,
+      destinationId: seg.dstNode,
+      srcPort: seg.srcPort,
+      dstPort: seg.dstPort,
+      simulationTimeMs: now,
+      lossProb,
+      lossAt,
+      flowId: `tcp:${seg.srcNode}:${seg.srcPort}>${seg.dstNode}:${seg.dstPort}`,
+      seq: seg.seq,
+      ackNo: seg.ackNo,
+      tcpFlags: seg.flags,
+      window: seg.window,
+      payloadLen: seg.payloadLen,
+    })
+  }
+
   // Inject one segment into the simulated network: pick the source's first hop,
   // build the Packet, and hand it to the local uplink's output queue. Shared by
-  // the legacy flow model (via _emit) and, from Milestone 2 on, the per-endpoint
-  // TCP stack. Returns the Packet, or null if the source has no route (which the
-  // caller treats as a send failure — counted as a drop).
+  // the legacy flow model (via _emit) and the per-endpoint TCP stack. Returns
+  // the Packet, or null if the source has no route (a send failure → a drop).
   private _injectSegment(a: InjectArgs): Packet | null {
     // The sending host makes only the first routing decision; every later hop is
     // chosen by the router the packet lands on. No route (e.g. firewall raised
@@ -641,12 +698,23 @@ export class SimulationEngine {
         return slot
       },
     }
-    for (const packet of this.packets) {
+    const tcpCtx = this._tcpCtx(realTimeMs)
+    // Fixed length: endpoints inject reply segments (ACKs, SYN-ACK, FIN) while we
+    // iterate, and those newcomers should be stepped next tick, not this one.
+    const list = this.packets
+    const n = list.length
+    for (let i = 0; i < n; i++) {
+      const packet = list[i]
       if (packet.status !== 'in-flight') continue
       const result = stepPacket(packet, deltaSeconds, ctx, this.graph.links)
       if (result === 'delivered') {
         this._aliveDec(packet)
-        this._onDelivered(packet, realTimeMs)
+        if (packet.tcpFlags !== undefined) {
+          // Real per-endpoint TCP: hand the segment to the destination host's stack.
+          this._endpoints.get(packet.destinationId)?.deliver(packet, tcpCtx)
+        } else {
+          this._onDelivered(packet, realTimeMs)
+        }
         this._lingerTimers.set(packet.id, realTimeMs + PACKET_LINGER_MS)
       } else if (result === 'dropped') {
         this._aliveDec(packet)
