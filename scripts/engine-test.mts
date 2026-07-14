@@ -344,6 +344,90 @@ console.log('transfer    :', serverTcb
   : '(no server connection)')
 console.log('teardown    :', `client ${clientTcb?.state ?? '-'}, server ${serverTcb?.state ?? '-'}`)
 
+// --- Milestone 3a: fast retransmit / NewReno under forced loss ---------------
+// With a fixed loss rate, paced sends produce isolated drops that 3 duplicate
+// ACKs recover (fast retransmit) rather than waiting for an RTO — and the
+// transfer still arrives byte-exact.
+function pickPair(eng: SimulationEngine): [string, string] {
+  for (const h of eng.graph.getHomeIds()) {
+    for (const s of eng.graph.getServerIds()) if (eng.graph.getRoute(h, s)) return [h, s]
+  }
+  return ['', '']
+}
+const t3 = new SimulationEngine()
+t3.setTcpTestLoss(0.04) // 4% per-segment loss
+const [c3, s3] = pickPair(t3)
+const FR_XFER = 64 * 1024
+t3.appConnect(c3, s3, 443, FR_XFER)
+let sawFastRetx = false
+{
+  const dt3 = 1 / 60
+  let ms3 = 0
+  const cep = t3.getTcpEndpoint(c3)!
+  for (let i = 0; i < Math.round(120 / dt3); i++) {
+    ms3 += dt3 * 1000
+    t3.tick(dt3, ms3)
+    const cc = [...cep.conns.values()][0]
+    if (cc?.inFastRecovery) sawFastRetx = true
+    if (cc && cc.state === 'CLOSED') break
+  }
+}
+const frClient = [...(t3.getTcpEndpoint(c3)?.conns.values() ?? [])][0]
+const frServer = [...(t3.getTcpEndpoint(s3)?.conns.values() ?? [])][0]
+let frHash = STREAM_HASH_INIT
+for (let i = 0; i < FR_XFER; i++) frHash = foldStreamHash(frHash, i)
+// Core proof: fast retransmit was exercised and the whole stream arrived
+// byte-exact under loss. Teardown-to-CLOSED under 4% loss is timing-sensitive
+// (covered at natural loss by the M2 test), so we only require the client to
+// have finished sending and begun closing.
+const closing = ['FIN_WAIT_1', 'FIN_WAIT_2', 'CLOSING', 'TIME_WAIT', 'CLOSED']
+const okFastRetx =
+  sawFastRetx &&
+  !!frServer && frServer.bytesDelivered === FR_XFER && frServer.deliverHash === frHash &&
+  !!frClient && closing.includes(frClient.state)
+console.log('\n--- Milestone 3a: fast retransmit (4% loss) ---')
+console.log('fast retx   :', `entered ${sawFastRetx}, delivered ${frServer?.bytesDelivered ?? 0}/${FR_XFER}, hash ${frServer?.deliverHash === frHash ? 'match' : 'MISMATCH'}, client ${frClient?.state ?? '-'}`)
+
+// --- Milestone 3b: flow control + zero-window persist ------------------------
+// A small receive buffer plus a receiver whose app stalls closes the window; the
+// sender stops (flow control) and probes (persist) until the reader wakes.
+const t4 = new SimulationEngine()
+const [c4, s4] = pickPair(t4)
+t4.getTcpEndpoint(s4)!.defaultRcvBuf = 4096
+const FC_XFER = 24 * 1024
+t4.appConnect(c4, s4, 443, FC_XFER)
+let sawZeroWin = false
+let sawPersist = false
+{
+  const dt4 = 1 / 60
+  let ms4 = 0
+  const cep = t4.getTcpEndpoint(c4)!
+  const sep = t4.getTcpEndpoint(s4)!
+  let stalled = false
+  let resumed = false
+  for (let i = 0; i < Math.round(90 / dt4); i++) {
+    ms4 += dt4 * 1000
+    t4.tick(dt4, ms4)
+    const cc = [...cep.conns.values()][0]
+    const ss = [...sep.conns.values()][0]
+    if (!stalled && ss && ss.bytesDelivered > 2048) { ss.readRate = 0; stalled = true }
+    if (stalled && !resumed && ms4 > 12000 && ss) { ss.readRate = Infinity; resumed = true }
+    if (cc?.sndWnd === 0) sawZeroWin = true
+    if (cc?.persistDeadline) sawPersist = true
+    if (cc && cc.state === 'CLOSED') break
+  }
+}
+const fcClient = [...(t4.getTcpEndpoint(c4)?.conns.values() ?? [])][0]
+const fcServer = [...(t4.getTcpEndpoint(s4)?.conns.values() ?? [])][0]
+let fcHash = STREAM_HASH_INIT
+for (let i = 0; i < FC_XFER; i++) fcHash = foldStreamHash(fcHash, i)
+const okFlowControl =
+  sawZeroWin && sawPersist &&
+  !!fcServer && fcServer.bytesDelivered === FC_XFER && fcServer.deliverHash === fcHash &&
+  fcClient?.state === 'CLOSED'
+console.log('\n--- Milestone 3b: flow control + persist ---')
+console.log('flow ctrl   :', `zero-window ${sawZeroWin}, persist ${sawPersist}, delivered ${fcServer?.bytesDelivered ?? 0}/${FC_XFER}, client ${fcClient?.state ?? '-'}`)
+
 console.log('\n--- Results ---')
 console.log('flows complete    :', okNormal ? 'PASS' : 'FAIL')
 console.log('tcp handshake seen:', sawHandshake || protocolsSeen >= 0 ? 'PASS' : 'FAIL')
@@ -360,11 +444,14 @@ console.log('firewall blocks   :', okFirewall ? 'PASS' : 'FAIL')
 console.log('reset clears state:', okReset ? 'PASS' : 'FAIL')
 console.log('tcp byte-exact    :', okByteExact ? 'PASS' : 'FAIL')
 console.log('tcp teardown      :', okTeardown ? 'PASS' : 'FAIL')
+console.log('tcp fast retransmit:', okFastRetx ? 'PASS' : 'FAIL')
+console.log('tcp flow control  :', okFlowControl ? 'PASS' : 'FAIL')
 
 if (
   !seqOk || !reasmOk ||
   !okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okQueues ||
-  !okBgpRouting || !okWithdrawal || !okDelay || !okRepair || !okFirewall || !okReset || !okM2
+  !okBgpRouting || !okWithdrawal || !okDelay || !okRepair || !okFirewall || !okReset || !okM2 ||
+  !okFastRetx || !okFlowControl
 )
   process.exit(1)
 console.log('\nALL CHECKS PASSED')

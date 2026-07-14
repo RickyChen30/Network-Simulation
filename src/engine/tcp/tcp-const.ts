@@ -42,6 +42,12 @@ export const MSL_MS = 500
 // Give up on a segment after this many retransmissions (connection reset).
 export const MAX_RETX = 8
 
+// Sender pacing: at most this many *new* segments per tick. Real TCP is ACK-
+// clocked and spreads a window across an RTT; injecting a whole large cwnd in
+// one instant would overrun the shallow router queues and cause burst losses
+// (which recover far slower than the isolated losses pacing produces).
+export const MAX_SEGS_PER_TICK = 4
+
 // Ephemeral (client) port range for active opens.
 export const EPHEMERAL_BASE = 49152
 export const EPHEMERAL_SPAN = 16384

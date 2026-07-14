@@ -5,6 +5,7 @@ import {
   INIT_CWND,
   INIT_SSTHRESH,
   RTO_INIT,
+  RCV_BUF,
   F_SYN,
   F_ACK,
   F_FIN,
@@ -74,6 +75,7 @@ export interface Tcb {
   irs: number
   rcvNxt: number // next in-order byte expected
   readSeq: number // next byte the app will consume (<= rcvNxt)
+  rcvBuf: number // receive-buffer capacity (bytes) — bounds the advertised window
   reasm: Reasm
 
   // Congestion control (Reno, in bytes).
@@ -97,6 +99,17 @@ export interface Tcb {
   delAckDeadline: number
   timeWaitDeadline: number
   persistDeadline: number
+  persistBackoff: number // current zero-window probe interval (backs off)
+
+  // Delayed ACK: hold an ACK briefly to coalesce, per RFC 1122.
+  ackPending: boolean
+  unackedSegs: number
+
+  // Receiving application's consumption rate (bytes/sec; Infinity = drains
+  // instantly). A slow reader lets its buffer fill and the window close, which
+  // exercises flow control + persist.
+  readRate: number
+  lastRead: number
 
   // Retransmit queue: seq → bookkeeping for a sent-but-unacked segment.
   inflight: Map<number, { end: number; sentAt: number; retx: number }>
@@ -145,6 +158,7 @@ export function createTcb(a: CreateTcbArgs): Tcb {
     irs: 0,
     rcvNxt: 0,
     readSeq: 0,
+    rcvBuf: RCV_BUF,
     reasm: new Reasm(),
 
     cwnd: INIT_CWND,
@@ -165,6 +179,13 @@ export function createTcb(a: CreateTcbArgs): Tcb {
     delAckDeadline: 0,
     timeWaitDeadline: 0,
     persistDeadline: 0,
+    persistBackoff: RTO_INIT,
+
+    ackPending: false,
+    unackedSegs: 0,
+
+    readRate: Infinity,
+    lastRead: 0,
 
     inflight: new Map(),
 

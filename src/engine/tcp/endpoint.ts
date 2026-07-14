@@ -17,6 +17,9 @@ import {
   RTO_K,
   MSL_MS,
   MAX_RETX,
+  MAX_SEGS_PER_TICK,
+  DELAYED_ACK_MS,
+  DELAYED_ACK_SEGS,
   EPHEMERAL_BASE,
   EPHEMERAL_SPAN,
   F_SYN,
@@ -44,6 +47,10 @@ export class TcpEndpoint {
   readonly nodeId: string
   readonly conns = new Map<string, Tcb>()
   readonly listeners = new Set<number>()
+  // Applied to passively-opened connections. Lower these on a server endpoint to
+  // exercise flow control: a slow reader with a small buffer closes its window.
+  defaultReadRate = Infinity
+  defaultRcvBuf = RCV_BUF
   private nextEphemeral = EPHEMERAL_BASE
 
   constructor(nodeId: string) {
@@ -107,6 +114,8 @@ export class TcpEndpoint {
     tcb.rcvNxt = seqAdd(tcb.irs, 1) // the SYN occupies one sequence number
     tcb.readSeq = tcb.rcvNxt
     tcb.sndWnd = pkt.window ?? MSS
+    tcb.readRate = this.defaultReadRate
+    tcb.rcvBuf = this.defaultRcvBuf
     // Reply SYN|ACK; it occupies iss and is retransmitted by the RTO if lost.
     this.send(tcb, ctx, F_SYN | F_ACK, tcb.iss, 0)
     tcb.sndNxt = seqAdd(tcb.iss, 1)
@@ -127,9 +136,11 @@ export class TcpEndpoint {
       tcb.done = true
       return
     }
+    const prevWnd = tcb.sndWnd
     tcb.sndWnd = pkt.window ?? tcb.sndWnd
 
-    if (flags & F_ACK) this.processAck(tcb, ackNo, ctx)
+    if (flags & F_ACK) this.processAck(tcb, ackNo, prevWnd, len > 0, ctx)
+    if (tcb.sndWnd > 0) tcb.persistDeadline = 0 // the peer's window reopened
 
     // Complete the handshake.
     if (tcb.state === 'SYN_SENT') {
@@ -138,7 +149,7 @@ export class TcpEndpoint {
         tcb.rcvNxt = seqAdd(seq, 1)
         tcb.readSeq = tcb.rcvNxt
         tcb.state = 'ESTABLISHED'
-        this.sendAck(tcb, ctx) // third leg of the handshake
+        this.sendAckNow(tcb, ctx) // third leg of the handshake
       }
       return
     }
@@ -146,25 +157,40 @@ export class TcpEndpoint {
       tcb.state = 'ESTABLISHED'
     }
 
-    // Data + FIN.
-    let ackNeeded = false
+    // Data + FIN. In-order data may be delay-ACKed; an out-of-order segment (a
+    // gap) is ACKed immediately as a duplicate to drive the sender's fast
+    // retransmit, and a FIN is always ACKed at once.
+    let immediateAck = false
+    let delayedAck = false
     if (len > 0) {
-      this.recvData(tcb, seq, len)
-      ackNeeded = true
+      if (this.recvData(tcb, seq, len)) delayedAck = true
+      else immediateAck = true
+      if (tcb.reasm.hasGaps()) immediateAck = true
     }
     if (flags & F_FIN) {
       if (seq === tcb.rcvNxt) this.recvFin(tcb, ctx)
-      ackNeeded = true // ACK the FIN, or dup-ACK to prompt retransmit on a gap
+      immediateAck = true
     }
-    if (ackNeeded) this.sendAck(tcb, ctx)
+    if (immediateAck) this.sendAckNow(tcb, ctx)
+    else if (delayedAck) this.scheduleDelayedAck(tcb, ctx)
 
     this.checkFinAcked(tcb, ctx)
   }
 
-  private recvData(tcb: Tcb, seq: number, len: number): void {
+  // Returns true if in-order data was delivered (advancing rcvNxt), false for a
+  // pure duplicate or an out-of-order/over-window segment.
+  private recvData(tcb: Tcb, seq: number, len: number): boolean {
     // Ignore anything wholly at or below what we've already delivered.
-    if (seqLeq(seqAdd(seq, len), tcb.rcvNxt)) return
-    tcb.reasm.insert(seq, len)
+    if (seqLeq(seqAdd(seq, len), tcb.rcvNxt)) return false
+    // Flow control: never buffer beyond the advertised window (readSeq + rcvBuf).
+    const limit = seqAdd(tcb.readSeq, tcb.rcvBuf)
+    if (seqGeq(seq, limit)) return false
+    let end = seqAdd(seq, len)
+    if (seqGt(end, limit)) end = limit
+    const clamped = seqDiff(end, seq)
+    if (clamped <= 0) return false
+
+    tcb.reasm.insert(seq, clamped)
     const before = tcb.rcvNxt
     const after = tcb.reasm.advance(before)
     if (seqGt(after, before)) {
@@ -176,8 +202,9 @@ export class TcpEndpoint {
       }
       tcb.bytesDelivered += delivered
       tcb.rcvNxt = after
-      tcb.readSeq = after // the app consumes immediately in this model
+      return true
     }
+    return false
   }
 
   private recvFin(tcb: Tcb, ctx: TcpCtx): void {
@@ -199,11 +226,12 @@ export class TcpEndpoint {
     }
   }
 
-  private processAck(tcb: Tcb, ackNo: number, ctx: TcpCtx): void {
+  private processAck(tcb: Tcb, ackNo: number, prevWnd: number, hasData: boolean, ctx: TcpCtx): void {
     // Accept anything up to the highest byte ever sent (sndMax), not just the
     // current sndNxt: after a Go-Back-N rewind the receiver can cumulatively ACK
     // data it had buffered out of order, which lies beyond the rewound sndNxt.
     if (seqGt(ackNo, tcb.sndUna) && seqLeq(ackNo, tcb.sndMax)) {
+      const oldUna = tcb.sndUna
       // RTT sample (Jacobson/Karels) — but never off a retransmitted segment
       // (Karn's algorithm), since we can't tell which copy the ACK answers.
       if (tcb.rttTiming && !tcb.rttRetx && seqGt(ackNo, tcb.rttSeq)) {
@@ -224,15 +252,69 @@ export class TcpEndpoint {
       for (const [start, seg] of tcb.inflight) {
         if (seqLeq(seg.end, ackNo)) tcb.inflight.delete(start)
       }
-      // Congestion window growth, one step per ACK.
-      if (tcb.cwnd < tcb.ssthresh) tcb.cwnd += MSS // slow start
-      else tcb.cwnd += Math.max(1, Math.floor((MSS * MSS) / tcb.cwnd)) // congestion avoidance
-      tcb.dupAcks = 0
       tcb.retxCount = 0
+
+      if (tcb.inFastRecovery) {
+        if (seqGeq(ackNo, tcb.recover)) {
+          // Full ACK — recovery complete, deflate to the post-loss window.
+          tcb.cwnd = tcb.ssthresh
+          tcb.inFastRecovery = false
+          tcb.dupAcks = 0
+        } else {
+          // Partial ACK (NewReno): the next hole surfaced — retransmit it and
+          // deflate cwnd by the newly-acked amount (plus one segment).
+          this.resendOldest(tcb, ctx)
+          const acked = seqDiff(ackNo, oldUna)
+          tcb.cwnd = Math.max(MSS, tcb.cwnd - acked + MSS)
+        }
+      } else {
+        // Congestion window growth, one step per ACK.
+        if (tcb.cwnd < tcb.ssthresh) tcb.cwnd += MSS // slow start
+        else tcb.cwnd += Math.max(1, Math.floor((MSS * MSS) / tcb.cwnd)) // congestion avoidance
+        tcb.dupAcks = 0
+      }
       tcb.rtoDeadline = tcb.sndUna === tcb.sndNxt ? 0 : ctx.now + tcb.rto
-    } else if (ackNo === tcb.sndUna) {
-      tcb.dupAcks++ // Milestone 3: 3 dup-ACKs → fast retransmit
+    } else if (
+      ackNo === tcb.sndUna &&
+      !hasData &&
+      tcb.sndWnd === prevWnd &&
+      tcb.sndWnd > 0 &&
+      seqGt(tcb.sndNxt, tcb.sndUna)
+    ) {
+      // A genuine duplicate ACK: no data, no window change, window open, and we
+      // still have data outstanding.
+      tcb.dupAcks++
+      if (!tcb.inFastRecovery && tcb.dupAcks === 3) {
+        // Fast retransmit + enter fast recovery (Reno/NewReno).
+        tcb.ssthresh = Math.max(Math.floor(flightSize(tcb) / 2), 2 * MSS)
+        tcb.recover = tcb.sndMax
+        this.resendOldest(tcb, ctx)
+        tcb.cwnd = tcb.ssthresh + 3 * MSS
+        tcb.inFastRecovery = true
+      } else if (tcb.inFastRecovery) {
+        tcb.cwnd += MSS // inflate — each dup-ACK means a segment left the network
+      }
     }
+  }
+
+  // Retransmit just the oldest unacknowledged segment (fast retransmit / NewReno
+  // partial-ACK), without the Go-Back-N rewind an RTO does.
+  private resendOldest(tcb: Tcb, ctx: TcpCtx): void {
+    if (tcb.finSent && seqGeq(tcb.sndUna, tcb.finSeq)) {
+      this.send(tcb, ctx, F_FIN | F_ACK, tcb.finSeq, 0)
+    } else {
+      const dataEnd = tcb.finRequested ? tcb.finSeq : tcb.writeSeq
+      const len = Math.min(MSS, seqDiff(dataEnd, tcb.sndUna))
+      if (len <= 0) return
+      this.send(tcb, ctx, F_PSH | F_ACK, tcb.sndUna, len)
+    }
+    const seg = tcb.inflight.get(tcb.sndUna)
+    if (seg) {
+      seg.sentAt = ctx.now
+      seg.retx++
+    }
+    tcb.rttRetx = true
+    tcb.rtoDeadline = ctx.now + tcb.rto
   }
 
   private checkFinAcked(tcb: Tcb, ctx: TcpCtx): void {
@@ -258,6 +340,7 @@ export class TcpEndpoint {
   tick(ctx: TcpCtx): void {
     for (const tcb of this.conns.values()) {
       if (tcb.done) continue
+      this.drainApp(tcb, ctx)
       this.serviceTimers(tcb, ctx)
       if (tcb.done) continue
       this.sendSegments(tcb, ctx)
@@ -266,9 +349,35 @@ export class TcpEndpoint {
 
   private serviceTimers(tcb: Tcb, ctx: TcpCtx): void {
     if (tcb.rtoDeadline && ctx.now >= tcb.rtoDeadline) this.onRto(tcb, ctx)
+    if (tcb.ackPending && tcb.delAckDeadline && ctx.now >= tcb.delAckDeadline) {
+      this.sendAckNow(tcb, ctx)
+    }
+    if (tcb.persistDeadline && ctx.now >= tcb.persistDeadline) this.sendProbe(tcb, ctx)
     if (tcb.state === 'TIME_WAIT' && tcb.timeWaitDeadline && ctx.now >= tcb.timeWaitDeadline) {
       tcb.state = 'CLOSED'
       tcb.done = true
+    }
+  }
+
+  // Advance the receiving app's consumed pointer at its read rate, freeing
+  // receive-buffer space. A slow reader keeps its window small or closed; when
+  // the window reopens past a segment, send a proactive window update.
+  private drainApp(tcb: Tcb, ctx: TcpCtx): void {
+    if (tcb.readRate === Infinity) {
+      tcb.readSeq = tcb.rcvNxt
+      return
+    }
+    if (tcb.lastRead === 0) tcb.lastRead = ctx.now
+    const dt = ctx.now - tcb.lastRead
+    if (dt <= 0) return
+    tcb.lastRead = ctx.now
+    const freeBefore = this.recvWindow(tcb)
+    const canRead = Math.floor((tcb.readRate * dt) / 1000)
+    const buffered = seqDiff(tcb.rcvNxt, tcb.readSeq)
+    const n = Math.min(canRead, buffered)
+    if (n > 0) tcb.readSeq = seqAdd(tcb.readSeq, n)
+    if (freeBefore < MSS && this.recvWindow(tcb) >= MSS && tcb.state !== 'CLOSED') {
+      this.sendAckNow(tcb, ctx) // window-update: tell the sender it reopened
     }
   }
 
@@ -286,6 +395,8 @@ export class TcpEndpoint {
     // Multiplicative decrease (a timeout is the strongest congestion signal).
     tcb.ssthresh = Math.max(Math.floor(flightSize(tcb) / 2), 2 * MSS)
     tcb.cwnd = MSS
+    tcb.inFastRecovery = false // a timeout supersedes fast recovery
+    tcb.dupAcks = 0
     tcb.rttTiming = false // let a fresh (clean) RTT sample restart once recovered
     tcb.rto = Math.min(tcb.rto * 2, RTO_MAX) // exponential backoff
     tcb.rtoDeadline = now + tcb.rto
@@ -330,7 +441,11 @@ export class TcpEndpoint {
       return
     }
 
-    const win = Math.max(MSS, Math.min(tcb.cwnd, tcb.sndWnd))
+    // Usable window respects BOTH congestion control (cwnd) and the peer's
+    // advertised receive window (sndWnd) — flow control. If sndWnd is 0 nothing
+    // is sent and the persist timer (below) takes over.
+    const win = Math.min(tcb.cwnd, tcb.sndWnd)
+    let sentThisTick = 0
     for (;;) {
       const flight = flightSize(tcb)
       if (flight >= win) break
@@ -339,6 +454,7 @@ export class TcpEndpoint {
       const avail = seqDiff(dataEnd, tcb.sndNxt)
 
       if (avail > 0) {
+        if (sentThisTick >= MAX_SEGS_PER_TICK) break // pace: spread the window
         const len = Math.min(avail, MSS, can)
         if (len <= 0) break
         const end = seqAdd(tcb.sndNxt, len)
@@ -348,6 +464,7 @@ export class TcpEndpoint {
         tcb.sndNxt = end
         if (isNew) tcb.sndMax = end
         this.armRto(tcb, ctx.now)
+        sentThisTick++
         continue
       }
 
@@ -366,6 +483,32 @@ export class TcpEndpoint {
       }
       break
     }
+
+    // Zero-window persist: the peer's window is shut but we still have data (or a
+    // FIN) to send and nothing is in flight to elicit an ACK. Arm the probe timer.
+    const end = tcb.finRequested ? tcb.finSeq : tcb.writeSeq
+    const haveMore = seqGt(end, tcb.sndNxt) || (tcb.finRequested && !tcb.finSent)
+    if (tcb.sndWnd === 0 && haveMore && flightSize(tcb) === 0 && !tcb.persistDeadline) {
+      tcb.persistBackoff = Math.max(RTO_MIN, tcb.rto)
+      tcb.persistDeadline = ctx.now + tcb.persistBackoff
+    }
+  }
+
+  // Zero-window probe: send one byte (or the FIN) beyond sndNxt to force the
+  // receiver to re-advertise its window, then back off and re-arm.
+  private sendProbe(tcb: Tcb, ctx: TcpCtx): void {
+    const dataEnd = tcb.finRequested ? tcb.finSeq : tcb.writeSeq
+    if (seqGt(dataEnd, tcb.sndNxt)) {
+      const end = seqAdd(tcb.sndNxt, 1)
+      const isNew = seqGeq(tcb.sndNxt, tcb.sndMax)
+      this.send(tcb, ctx, F_PSH | F_ACK, tcb.sndNxt, 1)
+      this.track(tcb, tcb.sndNxt, end, ctx.now, isNew)
+      tcb.sndNxt = end
+      if (isNew) tcb.sndMax = end
+      this.armRto(tcb, ctx.now)
+    }
+    tcb.persistBackoff = Math.min(RTO_MAX, tcb.persistBackoff * 2)
+    tcb.persistDeadline = ctx.now + tcb.persistBackoff
   }
 
   // ---- helpers ------------------------------------------------------------
@@ -382,10 +525,29 @@ export class TcpEndpoint {
       window: this.recvWindow(tcb),
       payloadLen,
     })
+    // Any segment we send carries our current ACK, so a pending delayed ACK is
+    // satisfied (piggybacked).
+    if (flags & F_ACK) {
+      tcb.ackPending = false
+      tcb.unackedSegs = 0
+      tcb.delAckDeadline = 0
+    }
   }
 
-  private sendAck(tcb: Tcb, ctx: TcpCtx): void {
+  private sendAckNow(tcb: Tcb, ctx: TcpCtx): void {
     this.send(tcb, ctx, F_ACK, tcb.sndNxt, 0)
+  }
+
+  // Hold the ACK briefly (delayed ACK) unless a second unacked segment has piled
+  // up, in which case ACK immediately.
+  private scheduleDelayedAck(tcb: Tcb, ctx: TcpCtx): void {
+    tcb.unackedSegs++
+    if (tcb.unackedSegs >= DELAYED_ACK_SEGS) {
+      this.sendAckNow(tcb, ctx)
+      return
+    }
+    tcb.ackPending = true
+    if (!tcb.delAckDeadline) tcb.delAckDeadline = ctx.now + DELAYED_ACK_MS
   }
 
   private track(tcb: Tcb, start: number, end: number, now: number, isNew: boolean): void {
@@ -406,7 +568,7 @@ export class TcpEndpoint {
 
   private recvWindow(tcb: Tcb): number {
     const buffered = (tcb.rcvNxt - tcb.readSeq) | 0
-    return Math.min(65535, RCV_BUF - buffered)
+    return Math.max(0, Math.min(65535, tcb.rcvBuf - buffered))
   }
 
   private allocEphemeralPort(): number {

@@ -177,9 +177,9 @@ export class SimulationEngine {
 
   private _flows: Flow[]
   private _scheduler: LinkScheduler
-  // Per-host TCP endpoints (home + server nodes). Built here and left inert
-  // until Milestone 2 wires delivery + tick; see docs/tcp-endpoints-plan.md.
+  // Per-host TCP endpoints (home + server nodes).
   private _endpoints: Map<string, TcpEndpoint>
+  private _tcpTestLoss: number | null = null
   private _isPaused: boolean
   private _routingMode: RoutingMode
   private _isDDoS: boolean
@@ -460,11 +460,18 @@ export class SimulationEngine {
     }
   }
 
+  // Test hook: force a fixed per-segment loss probability for endpoint TCP
+  // (null = use the realistic per-path model). Lets tests exercise retransmission
+  // deterministically. Not used by the live simulation.
+  setTcpTestLoss(prob: number | null): void {
+    this._tcpTestLoss = prob
+  }
+
   // Turn one endpoint OutSegment into a Packet on the wire, rolling per-path loss
   // so real segments can drop (and be retransmitted) like legacy traffic.
   private _injectTcpSegment(seg: OutSegment, now: number): void {
     const route = this.graph.getRoute(seg.srcNode, seg.dstNode)
-    const lossProb = route ? this._pathLossProb(route) : 0
+    const lossProb = this._tcpTestLoss ?? (route ? this._pathLossProb(route) : 0)
     const lossAt = Math.random() < lossProb ? 0.3 + Math.random() * 0.5 : null
     const hasData = seg.payloadLen > 0
     this._injectSegment({
