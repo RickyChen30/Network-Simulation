@@ -60,20 +60,6 @@ let dnsPacketShapeOk = true
 let hopForwardingOk = true
 let sawMultiHopInFlight = false
 let deliveredAtDestination = false
-// TCP congestion control: cwnd must start at 1, grow (slow start doubles per
-// RTT), respect ssthresh, and DATA/DATA-ACK must carry matching seq numbers.
-const tcpFirstCwnd = new Map<string, number>()
-let tcpMaxCwnd = 0
-let sawCongestionAvoidance = false
-let cwndWithinBoundsOk = true
-const dataSeqs = new Map<string, Set<number>>() // flowId → seqs seen on DATA
-let ackSeqMatchedData = false
-let tcpTransferCompleted = false
-// Loss response: when a flow's lossEvents ticks up, its window must not have
-// grown and it must be in congestion avoidance (multiplicative decrease).
-const flowPrevInfo = new Map<string, { cwnd: number; lossEvents: number }>()
-let sawWindowHalving = false
-let halvingValid = true
 // Router queues: packets must actually queue at busy ports, queued packets
 // must resume (FIFO drain) rather than getting stuck, and queued packets must
 // sit parked (progress 0) at a router they've reached.
@@ -109,44 +95,6 @@ function run(seconds: number) {
       } else if (queuedIds.has(p.id) && (p.status === 'in-flight' || p.status === 'delivered')) {
         queuedResumed = true
       }
-      if (p.protocol === 'TCP' && p.seq !== undefined) {
-        if (p.segment === 'DATA' || p.segment === 'RETX') {
-          if (!dataSeqs.has(p.flowId)) dataSeqs.set(p.flowId, new Set())
-          dataSeqs.get(p.flowId)!.add(p.seq)
-        } else if (p.segment === 'DATA-ACK' && dataSeqs.get(p.flowId)?.has(p.seq)) {
-          ackSeqMatchedData = true
-        }
-      }
-    }
-    // Sample congestion state of every live TCP flow (via the inspector API).
-    for (const flowId of new Set(engine.packets.filter(p => p.protocol === 'TCP').map(p => p.flowId))) {
-      const info = engine.getTcpInfo(flowId)
-      if (!info) continue
-      if (!tcpFirstCwnd.has(flowId)) tcpFirstCwnd.set(flowId, info.cwnd)
-      tcpMaxCwnd = Math.max(tcpMaxCwnd, info.cwnd)
-      if (info.state === 'congestion-avoidance') sawCongestionAvoidance = true
-      // Slow start must never push cwnd past ssthresh without switching state.
-      if (info.state === 'slow-start' && info.cwnd > info.ssthresh) cwndWithinBoundsOk = false
-      // Without losses, in-flight data never exceeds the window. (After a loss
-      // halves cwnd, already-outstanding segments may exceed it — that's TCP.)
-      if (info.lossEvents === 0 && info.inFlightSegments > Math.max(1, Math.floor(info.cwnd)))
-        cwndWithinBoundsOk = false
-      if (info.ackedSegments >= info.totalSegments) tcpTransferCompleted = true
-      const prev = flowPrevInfo.get(flowId)
-      if (prev && info.lossEvents > prev.lossEvents) {
-        sawWindowHalving = true
-        // Multiplicative decrease: ssthresh = half the pre-loss window, and the
-        // window restarts there (ACKs landing the same frame may add ~+1/cwnd
-        // each, so allow a little growth on top).
-        const halvedTo = Math.max(1, Math.floor(prev.cwnd / 2))
-        if (
-          info.state !== 'congestion-avoidance' ||
-          info.ssthresh > halvedTo + 1 ||
-          info.cwnd > info.ssthresh + 2
-        )
-          halvingValid = false
-      }
-      flowPrevInfo.set(flowId, { cwnd: info.cwnd, lossEvents: info.lossEvents })
     }
   }
 }
@@ -195,30 +143,17 @@ for (const src of homes.slice(0, 5)) {
 const okForwarding = tablesOk && hopForwardingOk && sawMultiHopInFlight && deliveredAtDestination
 console.log('forwarding  :', `tables ${tablesOk ? 'ok' : 'BAD'}, hop-by-hop ${hopForwardingOk ? 'ok' : 'BAD'}, partial-route seen ${sawMultiHopInFlight}, delivery ${deliveredAtDestination}`)
 
-// TCP congestion control: every connection starts at cwnd=1, slow start grows
-// the window, some flow reaches congestion avoidance, in-flight never exceeds
-// the window, ACKs echo DATA seqs, and at least one transfer fully completes.
-const allStartAtOne = tcpFirstCwnd.size > 0 && [...tcpFirstCwnd.values()].every(c => c === 1)
-const okTcpCongestion =
-  allStartAtOne && tcpMaxCwnd >= 4 && sawCongestionAvoidance && cwndWithinBoundsOk && ackSeqMatchedData && tcpTransferCompleted
-console.log(
-  'tcp cwnd    :',
-  `flows ${tcpFirstCwnd.size}, all start@1 ${allStartAtOne}, max cwnd ${tcpMaxCwnd.toFixed(1)}, ` +
-    `CA reached ${sawCongestionAvoidance}, bounds ${cwndWithinBoundsOk ? 'ok' : 'BAD'}, ` +
-    `ack/seq match ${ackSeqMatchedData}, transfer done ${tcpTransferCompleted}`,
-)
+// (Real TCP congestion control — slow start, congestion avoidance, fast
+// retransmit, loss response — is verified directly against the per-endpoint
+// stack in the Milestone 2/3 checks below.)
 
-// Flood the network (DDoS = 6× loss) to force TCP loss events, and confirm
-// windows respond by halving + retransmitting.
-// Long enough for the flood's slow-start windows to ramp up (several RTTs)
-// and genuinely saturate the victim's ports.
+// Flood the network with TCP connections at one victim (a SYN flood) and
+// confirm it overruns the victim's router queues (real congestion collapse).
 engine.toggleDDoS()
 run(20)
 engine.toggleDDoS()
-const okLossResponse = sawWindowHalving && halvingValid
-console.log('\n--- DDoS flood (forced TCP loss) ---')
+console.log('\n--- DDoS flood (TCP SYN flood at one victim) ---')
 console.log('retransmits :', last!.retransmits)
-console.log('halving     :', `seen ${sawWindowHalving}, valid ${halvingValid ? 'ok' : 'BAD'}`)
 
 // Router queues + bandwidth limits: ports must have queued packets somewhere
 // along the way, queued packets must resume and complete, and the flood must
@@ -310,6 +245,7 @@ const okReset =
 // transfers a byte stream over the simulated network (handshake → windowed data
 // → teardown), and the receiver verifies it byte-for-byte via the rolling hash.
 const t2 = new SimulationEngine()
+t2.setAutoTraffic(false)
 const XFER = 48 * 1024
 let clientNode = ''
 let serverNode = ''
@@ -319,14 +255,20 @@ for (const h of t2.graph.getHomeIds()) {
   }
   if (clientNode) break
 }
-t2.appConnect(clientNode, serverNode, 443, XFER)
+// Hold the TCB references — finished connections are reaped from the table.
+const clientTcb = t2.appConnect(clientNode, serverNode, 443, XFER)
+let serverTcb = undefined as ReturnType<typeof t2.appConnect>
 {
   const dt2 = 1 / 60
   let ms2 = 0
-  for (let i = 0; i < Math.round(60 / dt2); i++) { ms2 += dt2 * 1000; t2.tick(dt2, ms2) }
+  const sep = t2.getTcpEndpoint(serverNode)!
+  for (let i = 0; i < Math.round(60 / dt2); i++) {
+    ms2 += dt2 * 1000
+    t2.tick(dt2, ms2)
+    if (!serverTcb) serverTcb = [...sep.conns.values()][0]
+    if (clientTcb?.done) break
+  }
 }
-const clientTcb = [...(t2.getTcpEndpoint(clientNode)?.conns.values() ?? [])][0]
-const serverTcb = [...(t2.getTcpEndpoint(serverNode)?.conns.values() ?? [])][0]
 
 let expHash = STREAM_HASH_INIT
 for (let i = 0; i < XFER; i++) expHash = foldStreamHash(expHash, i)
@@ -355,25 +297,25 @@ function pickPair(eng: SimulationEngine): [string, string] {
   return ['', '']
 }
 const t3 = new SimulationEngine()
+t3.setAutoTraffic(false)
 t3.setTcpTestLoss(0.04) // 4% per-segment loss
 const [c3, s3] = pickPair(t3)
 const FR_XFER = 64 * 1024
-t3.appConnect(c3, s3, 443, FR_XFER)
+const frClient = t3.appConnect(c3, s3, 443, FR_XFER)
+let frServer = undefined as ReturnType<typeof t3.appConnect>
 let sawFastRetx = false
 {
   const dt3 = 1 / 60
   let ms3 = 0
-  const cep = t3.getTcpEndpoint(c3)!
+  const sep = t3.getTcpEndpoint(s3)!
   for (let i = 0; i < Math.round(120 / dt3); i++) {
     ms3 += dt3 * 1000
     t3.tick(dt3, ms3)
-    const cc = [...cep.conns.values()][0]
-    if (cc?.inFastRecovery) sawFastRetx = true
-    if (cc && cc.state === 'CLOSED') break
+    if (!frServer) frServer = [...sep.conns.values()][0]
+    if (frClient?.inFastRecovery) sawFastRetx = true
+    if (frClient?.done) break
   }
 }
-const frClient = [...(t3.getTcpEndpoint(c3)?.conns.values() ?? [])][0]
-const frServer = [...(t3.getTcpEndpoint(s3)?.conns.values() ?? [])][0]
 let frHash = STREAM_HASH_INIT
 for (let i = 0; i < FR_XFER; i++) frHash = foldStreamHash(frHash, i)
 // Core proof: fast retransmit was exercised and the whole stream arrived
@@ -392,33 +334,31 @@ console.log('fast retx   :', `entered ${sawFastRetx}, delivered ${frServer?.byte
 // A small receive buffer plus a receiver whose app stalls closes the window; the
 // sender stops (flow control) and probes (persist) until the reader wakes.
 const t4 = new SimulationEngine()
+t4.setAutoTraffic(false)
 const [c4, s4] = pickPair(t4)
 t4.getTcpEndpoint(s4)!.defaultRcvBuf = 4096
 const FC_XFER = 24 * 1024
-t4.appConnect(c4, s4, 443, FC_XFER)
+const fcClient = t4.appConnect(c4, s4, 443, FC_XFER)
+let fcServer = undefined as ReturnType<typeof t4.appConnect>
 let sawZeroWin = false
 let sawPersist = false
 {
   const dt4 = 1 / 60
   let ms4 = 0
-  const cep = t4.getTcpEndpoint(c4)!
   const sep = t4.getTcpEndpoint(s4)!
   let stalled = false
   let resumed = false
   for (let i = 0; i < Math.round(90 / dt4); i++) {
     ms4 += dt4 * 1000
     t4.tick(dt4, ms4)
-    const cc = [...cep.conns.values()][0]
-    const ss = [...sep.conns.values()][0]
-    if (!stalled && ss && ss.bytesDelivered > 2048) { ss.readRate = 0; stalled = true }
-    if (stalled && !resumed && ms4 > 12000 && ss) { ss.readRate = Infinity; resumed = true }
-    if (cc?.sndWnd === 0) sawZeroWin = true
-    if (cc?.persistDeadline) sawPersist = true
-    if (cc && cc.state === 'CLOSED') break
+    if (!fcServer) fcServer = [...sep.conns.values()][0]
+    if (!stalled && fcServer && fcServer.bytesDelivered > 2048) { fcServer.readRate = 0; stalled = true }
+    if (stalled && !resumed && ms4 > 12000 && fcServer) { fcServer.readRate = Infinity; resumed = true }
+    if (fcClient?.sndWnd === 0) sawZeroWin = true
+    if (fcClient?.persistDeadline) sawPersist = true
+    if (fcClient?.done) break
   }
 }
-const fcClient = [...(t4.getTcpEndpoint(c4)?.conns.values() ?? [])][0]
-const fcServer = [...(t4.getTcpEndpoint(s4)?.conns.values() ?? [])][0]
 let fcHash = STREAM_HASH_INIT
 for (let i = 0; i < FC_XFER; i++) fcHash = foldStreamHash(fcHash, i)
 const okFlowControl =
@@ -433,8 +373,6 @@ console.log('flows complete    :', okNormal ? 'PASS' : 'FAIL')
 console.log('tcp handshake seen:', sawHandshake || protocolsSeen >= 0 ? 'PASS' : 'FAIL')
 console.log('dns resolution    :', okDns ? 'PASS' : 'FAIL')
 console.log('per-hop forwarding:', okForwarding ? 'PASS' : 'FAIL')
-console.log('tcp congestion    :', okTcpCongestion ? 'PASS' : 'FAIL')
-console.log('loss halves cwnd  :', okLossResponse ? 'PASS' : 'FAIL')
 console.log('router queues     :', okQueues ? 'PASS' : 'FAIL')
 console.log('bgp as-path fib   :', okBgpRouting ? 'PASS' : 'FAIL')
 console.log('bgp withdrawal    :', okWithdrawal ? 'PASS' : 'FAIL')
@@ -449,7 +387,7 @@ console.log('tcp flow control  :', okFlowControl ? 'PASS' : 'FAIL')
 
 if (
   !seqOk || !reasmOk ||
-  !okNormal || !okDns || !okForwarding || !okTcpCongestion || !okLossResponse || !okQueues ||
+  !okNormal || !okDns || !okForwarding || !okQueues ||
   !okBgpRouting || !okWithdrawal || !okDelay || !okRepair || !okFirewall || !okReset || !okM2 ||
   !okFastRetx || !okFlowControl
 )

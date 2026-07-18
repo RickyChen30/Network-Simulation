@@ -4,7 +4,6 @@ import type {
   RoutingMode,
   Protocol,
   Segment,
-  TcpCongestionState,
   TcpCongestionInfo,
 } from '../types/network'
 import { NetworkGraph } from './network'
@@ -12,8 +11,8 @@ import { computePathLatency } from './routing'
 import { createPacket, resetPacketCounter, stepPacket, type ForwardingContext } from './packet'
 import { LinkScheduler } from './queues'
 import { TcpEndpoint } from './tcp/endpoint'
-import { flagsToLabel, type TcpCtx, type OutSegment } from './tcp/tcb'
-import { PORT_HTTP, PORT_HTTPS } from './tcp/tcp-const'
+import { flagsToLabel, type TcpCtx, type OutSegment, type Tcb } from './tcp/tcb'
+import { PORT_HTTP, PORT_HTTPS, MSS as TCP_MSS } from './tcp/tcp-const'
 import { MAX_ACTIVE_PACKETS, PACKET_LINGER_MS, LATENCY_WINDOW } from '../config/constants'
 
 // --- Flow model ------------------------------------------------------------
@@ -22,30 +21,13 @@ import { MAX_ACTIVE_PACKETS, PACKET_LINGER_MS, LATENCY_WINDOW } from '../config/
 // and ICMP steps are stop-and-wait (the next step waits for the previous packet
 // to arrive), so the handshake plays out in order; UDP datagrams just stream.
 
+// Since Milestone 4, TCP runs on the real per-endpoint stack (engine/tcp/*).
+// Flows now model only the connectionless protocols — UDP datagram exchanges,
+// ICMP echo/reply pings, and standalone DNS lookups.
 interface FlowStep {
   segment: Segment
   dir: 'fwd' | 'ret'
   wait: boolean
-  // 'dns' steps ride the short city → resolver path as UDP port 53, regardless
-  // of the flow's own protocol. A 'transfer' step is a placeholder for TCP's
-  // whole data phase: instead of one packet, it runs the congestion-window
-  // machinery until every segment is acked, then the flow moves on to FIN.
-  phase?: 'dns' | 'transfer'
-}
-
-// Per-flow TCP congestion control (the sender's view of the data transfer).
-interface TcpTransfer {
-  cwnd: number // congestion window in segments; fractional during additive increase
-  ssthresh: number // slow-start threshold
-  state: TcpCongestionState
-  totalSegments: number // how many DATA segments this connection sends
-  nextSeq: number // next unsent sequence number
-  ackedCount: number
-  // Sent-but-unacked segments: seq → send bookkeeping for timeout/retransmit.
-  inFlight: Map<number, { sentAt: number; retx: number }>
-  lastDataSent: number
-  lastLossResponse: number // so one loss burst halves the window once, not per segment
-  lossEvents: number
 }
 
 interface Flow {
@@ -55,10 +37,6 @@ interface Flow {
   dstId: string
   fwdPath: string[]
   revPath: string[]
-  // Path to the city's DNS resolver (its uplink hub), when this flow had to
-  // resolve the server's name first; null on a resolver-cache hit.
-  dnsPath: string[] | null
-  dnsRevPath: string[] | null
   srcPort: number
   dstPort: number
   steps: FlowStep[]
@@ -71,21 +49,20 @@ interface Flow {
   rttRecorded: boolean
   lastEmit: number
   lossProb: number // per-packet loss probability for this flow's path
-  dnsLossProb: number // same, for the short DNS path
-  tcp: TcpTransfer | null // congestion-control state (TCP flows only)
+  internal: boolean // infrastructure traffic (DNS lookups) — not a user "connection"
   done: boolean
 }
 
-const FLOW_SPAWN_RATE = 1.3 // new flows per real second
-const MAX_FLOWS = 26
-const TCP_TIMEOUT_MS = 1100 // retransmit timeout for an un-acked TCP segment
+const FLOW_SPAWN_RATE = 1.6 // new traffic sessions per real second
+const MAX_FLOWS = 26 // concurrent UDP/ICMP/DNS flows
+const MAX_TCP_CONNS = 16 // concurrent real TCP connections
+const FLOW_RETX_TIMEOUT_MS = 1100 // retransmit timeout for an un-acked flow packet
 const UDP_STAGGER_MS = 110 // gap between UDP datagrams
 const MAX_RETX = 4
-// --- TCP congestion control ---
-const TCP_INITIAL_CWND = 1 // segments — every connection starts probing from 1
-const TCP_INITIAL_SSTHRESH = 8 // segments — where slow start hands over to additive increase
-const TCP_DATA_STAGGER_MS = 90 // spacing within a window burst (so trains are visible)
-// DDoS drops are not faked with a loss multiplier: the flood's packets
+// New TCP connections transfer a small web-request-sized object.
+const TCP_XFER_MIN = 2_000
+const TCP_XFER_SPAN = 18_000
+// DDoS drops are not faked with a loss multiplier: the flood's connections
 // genuinely overflow the victim's router queues (see queues.ts), and those
 // tail drops are what TCP senders back off from.
 const DDOS_SPAWN_MULTIPLIER = 6
@@ -116,25 +93,8 @@ function pickProtocol(ddos: boolean): Protocol {
   return 'ICMP'
 }
 
-function destPort(protocol: Protocol): number {
-  if (protocol === 'TCP') return Math.random() < 0.5 ? 443 : 80
-  if (protocol === 'UDP') return Math.random() < 0.5 ? 53 : 443
-  return 0
-}
-
-function buildSteps(protocol: Protocol): FlowStep[] {
-  if (protocol === 'TCP') {
-    // Handshake, then the whole windowed data phase (driven by the congestion
-    // window, not by steps), then teardown.
-    return [
-      { segment: 'SYN', dir: 'fwd', wait: true },
-      { segment: 'SYN-ACK', dir: 'ret', wait: true },
-      { segment: 'ACK', dir: 'fwd', wait: true },
-      { segment: 'DATA', dir: 'fwd', wait: false, phase: 'transfer' },
-      { segment: 'FIN', dir: 'fwd', wait: true },
-      { segment: 'FIN-ACK', dir: 'ret', wait: true },
-    ]
-  }
+// Steps for the connectionless flow protocols (UDP datagrams / ICMP ping).
+function buildSteps(protocol: 'UDP' | 'ICMP'): FlowStep[] {
   if (protocol === 'UDP') {
     const n = 3 + Math.floor(Math.random() * 6)
     return Array.from({ length: n }, () => ({ segment: 'DATAGRAM' as Segment, dir: 'fwd' as const, wait: false }))
@@ -179,7 +139,9 @@ export class SimulationEngine {
   private _scheduler: LinkScheduler
   // Per-host TCP endpoints (home + server nodes).
   private _endpoints: Map<string, TcpEndpoint>
+  private _homeIds?: Set<string>
   private _tcpTestLoss: number | null = null
+  private _autoTraffic = true // live spawner (tests disable it for isolation)
   private _isPaused: boolean
   private _routingMode: RoutingMode
   private _isDDoS: boolean
@@ -310,83 +272,130 @@ export class SimulationEngine {
   }
 
   private _spawnFlows(deltaSeconds: number, now: number): void {
-    // A flood brings far more concurrent connections than normal traffic.
-    const maxFlows = this._isDDoS ? MAX_FLOWS * 2 : MAX_FLOWS
-    const maxAlive = this._isDDoS ? MAX_ACTIVE_PACKETS * 2 : MAX_ACTIVE_PACKETS
-    const active = this._flows.filter(f => !f.done).length
-    if (active >= maxFlows) return
-    if (this.packets.filter(p => this._isAlive(p)).length >= maxAlive) return
+    if (!this._autoTraffic) return
+    if (this.packets.filter(p => this._isAlive(p)).length >= this._maxAlive()) return
 
     const rate = this._isDDoS ? FLOW_SPAWN_RATE * DDOS_SPAWN_MULTIPLIER : FLOW_SPAWN_RATE
     this._spawnAccumulator += rate * deltaSeconds
     while (this._spawnAccumulator >= 1) {
       this._spawnAccumulator -= 1
-      this._createFlow(now)
+      this._spawnTraffic(now)
     }
   }
 
-  // A city's uplink hub doubles as its ISP's recursive DNS resolver, so a
-  // lookup is one short hop up the access link and back.
-  private _resolverPath(cityId: string): string[] | null {
-    const link = this.graph
-      .getActiveLinks()
-      .find(l => l.sourceId === cityId || l.targetId === cityId)
-    if (!link) return null
-    return [cityId, link.sourceId === cityId ? link.targetId : link.sourceId]
+  private _maxAlive(): number {
+    return this._isDDoS ? MAX_ACTIVE_PACKETS * 2 : MAX_ACTIVE_PACKETS
   }
 
-  private _createFlow(now: number): void {
+  // Total live TCP connections across all host endpoints.
+  private _activeConnCount(): number {
+    let n = 0
+    for (const ep of this._endpoints.values()) {
+      for (const tcb of ep.conns.values()) if (!tcb.done) n++
+    }
+    return n
+  }
+
+  // Start one new traffic session: a real TCP connection, or a connectionless
+  // UDP/ICMP flow. DDoS floods TCP connections at one victim (a SYN flood).
+  private _spawnTraffic(now: number): void {
     const homes = this.graph.getHomeIds()
     const servers = this.graph.getServerIds()
     if (homes.length === 0 || servers.length === 0) return
 
     const srcId = homes[Math.floor(Math.random() * homes.length)]
-    // A DDoS flood converges on one victim server; normal traffic spreads out.
     const dstId =
       this._isDDoS && this._ddosTargetId
         ? this._ddosTargetId
         : servers[Math.floor(Math.random() * servers.length)]
-    // Planned route, traced through the routers' forwarding tables. The flow
-    // keeps it only for estimates (loss probability, RTT); packets themselves
-    // are forwarded hop by hop and never carry it.
-    const fwdPath = this.graph.getRoute(srcId, dstId)
-
-    // No route (e.g. firewall up) → the connection attempt fails immediately.
-    if (!fwdPath) {
-      this._dropped++
+    if (!this.graph.getRoute(srcId, dstId)) {
+      this._dropped++ // no route (e.g. firewall up) → the attempt fails outright
       return
     }
 
     const protocol = pickProtocol(this._isDDoS)
-    const dstPort = destPort(protocol)
+    if (protocol === 'TCP') this._startTcpApp(srcId, dstId, now)
+    else this._createFlow(srcId, dstId, protocol, now)
+  }
 
-    // DNS resolution: before the city can open the flow it must resolve the
-    // server's name at its local resolver, unless the answer is still cached.
-    // Flows already destined to port 53 ARE DNS traffic and skip this.
-    const cached = (this._dnsCache.get(`${srcId}>${dstId}`) ?? 0) > now
-    const dnsPath = dstPort !== 53 && !cached ? this._resolverPath(srcId) : null
-    const steps = buildSteps(protocol)
-    if (dnsPath) {
-      steps.unshift(
-        { segment: 'DNS-QUERY', dir: 'fwd', wait: true, phase: 'dns' },
-        { segment: 'DNS-RESPONSE', dir: 'ret', wait: true, phase: 'dns' },
-      )
-      this._dnsLookups++
+  // Open a real TCP connection (per-endpoint stack). A cache-miss on the server
+  // name first fires an ambient DNS lookup (visible traffic + counter); the
+  // connection itself is opened right away.
+  private _startTcpApp(srcId: string, dstId: string, now: number): void {
+    if (this._activeConnCount() >= (this._isDDoS ? MAX_TCP_CONNS * 3 : MAX_TCP_CONNS)) return
+    const ep = this._endpoints.get(srcId)
+    if (!ep) return
+
+    if (!this._isDDoS) {
+      const cached = (this._dnsCache.get(`${srcId}>${dstId}`) ?? 0) > now
+      if (!cached) {
+        this._dnsCache.set(`${srcId}>${dstId}`, now + DNS_TTL_MS)
+        this._spawnDnsLookup(srcId, now)
+      }
     }
+    const port = Math.random() < 0.5 ? PORT_HTTPS : PORT_HTTP
+    const bytes = TCP_XFER_MIN + Math.floor(Math.random() * TCP_XFER_SPAN)
+    ep.connect(dstId, port, bytes)
+  }
 
+  // A DNS lookup: a short UDP :53 round-trip up the city's access link to its
+  // ISP resolver and back. Modeled as an internal two-step flow.
+  private _spawnDnsLookup(cityId: string, now: number): void {
+    const link = this.graph
+      .getActiveLinks()
+      .find(l => l.sourceId === cityId || l.targetId === cityId)
+    if (!link) return
+    const resolver = link.sourceId === cityId ? link.targetId : link.sourceId
+    const path = [cityId, resolver]
+    this._dnsLookups++
+    this._pushFlow({
+      protocol: 'UDP',
+      srcId: cityId,
+      dstId: resolver,
+      fwdPath: path,
+      dstPort: 53,
+      steps: [
+        { segment: 'DNS-QUERY', dir: 'fwd', wait: true },
+        { segment: 'DNS-RESPONSE', dir: 'ret', wait: true },
+      ],
+      internal: true,
+      now,
+    })
+  }
+
+  // A connectionless UDP/ICMP flow between a city and a server.
+  private _createFlow(srcId: string, dstId: string, protocol: 'UDP' | 'ICMP', now: number): void {
+    if (this._flows.filter(f => !f.done).length >= (this._isDDoS ? MAX_FLOWS * 2 : MAX_FLOWS)) return
+    const fwdPath = this.graph.getRoute(srcId, dstId)
+    if (!fwdPath) {
+      this._dropped++
+      return
+    }
+    const dstPort = protocol === 'UDP' ? (Math.random() < 0.5 ? 53 : 443) : 0
+    this._pushFlow({ protocol, srcId, dstId, fwdPath, dstPort, steps: buildSteps(protocol), internal: false, now })
+  }
+
+  private _pushFlow(a: {
+    protocol: Protocol
+    srcId: string
+    dstId: string
+    fwdPath: string[]
+    dstPort: number
+    steps: FlowStep[]
+    internal: boolean
+    now: number
+  }): void {
     _flowCounter++
     this._flows.push({
       id: `flow-${_flowCounter}`,
-      protocol,
-      srcId,
-      dstId,
-      fwdPath,
-      revPath: [...fwdPath].reverse(),
-      dnsPath,
-      dnsRevPath: dnsPath ? [...dnsPath].reverse() : null,
+      protocol: a.protocol,
+      srcId: a.srcId,
+      dstId: a.dstId,
+      fwdPath: a.fwdPath,
+      revPath: [...a.fwdPath].reverse(),
       srcPort: 49152 + Math.floor(Math.random() * 16000),
-      dstPort,
-      steps,
+      dstPort: a.dstPort,
+      steps: a.steps,
       stepIndex: 0,
       awaiting: false,
       awaitingPacketId: null,
@@ -395,23 +404,8 @@ export class SimulationEngine {
       retxCount: 0,
       rttRecorded: false,
       lastEmit: 0,
-      lossProb: this._pathLossProb(fwdPath),
-      dnsLossProb: dnsPath ? this._pathLossProb(dnsPath) : 0,
-      tcp:
-        protocol === 'TCP'
-          ? {
-              cwnd: TCP_INITIAL_CWND,
-              ssthresh: TCP_INITIAL_SSTHRESH,
-              state: 'slow-start',
-              totalSegments: 10 + Math.floor(Math.random() * 7), // 10–16
-              nextSeq: 0,
-              ackedCount: 0,
-              inFlight: new Map(),
-              lastDataSent: 0,
-              lastLossResponse: 0,
-              lossEvents: 0,
-            }
-          : null,
+      lossProb: this._pathLossProb(a.fwdPath),
+      internal: a.internal,
       done: false,
     })
   }
@@ -433,20 +427,37 @@ export class SimulationEngine {
   // --- Per-endpoint TCP wiring (Milestone 2) --------------------------------
 
   // Open a real TCP connection from a host node to a server:port, with an app
-  // that will send `bytes` bytes and then close. Returns false if the source is
-  // not a host endpoint. (Drives one connection for now; the live spawner is
-  // cut over to endpoints in a later milestone.)
-  appConnect(srcId: string, dstId: string, port: number, bytes: number): boolean {
+  // that will send `bytes` bytes and then close. Returns the client control
+  // block (hold the reference — finished connections are reaped from the table),
+  // or null if the source is not a host endpoint. Used by tests; the live
+  // spawner uses the same endpoints via _startTcpApp.
+  appConnect(srcId: string, dstId: string, port: number, bytes: number): Tcb | null {
     const ep = this._endpoints.get(srcId)
-    if (!ep) return false
-    ep.connect(dstId, port, bytes)
-    return true
+    if (!ep) return null
+    return ep.connect(dstId, port, bytes)
   }
 
   // Run every endpoint's timers + sender for this tick.
   private _tickEndpoints(now: number): void {
     const ctx = this._tcpCtx(now)
-    for (const ep of this._endpoints.values()) ep.tick(ctx)
+    const homes = this._homeIds ?? (this._homeIds = new Set(this.graph.getHomeIds()))
+    for (const [nodeId, ep] of this._endpoints) {
+      ep.tick(ctx)
+      const isClient = homes.has(nodeId)
+      for (const [key, tcb] of ep.conns) {
+        // Sample each connection's measured RTT once, into the latency readout.
+        if (isClient && !tcb.rttSampled && tcb.srtt > 0) {
+          tcb.rttSampled = true
+          this._recentRtts.push(tcb.srtt)
+          if (this._recentRtts.length > LATENCY_WINDOW) this._recentRtts.shift()
+        }
+        // Reap finished connections; a client's completion counts as a session.
+        if (tcb.done) {
+          if (isClient && tcb.finSent) this._completed++
+          ep.conns.delete(key)
+        }
+      }
+    }
   }
 
   // The seam the endpoints use to reach the network (routing + segment inject).
@@ -474,9 +485,10 @@ export class SimulationEngine {
     const lossProb = this._tcpTestLoss ?? (route ? this._pathLossProb(route) : 0)
     const lossAt = Math.random() < lossProb ? 0.3 + Math.random() * 0.5 : null
     const hasData = seg.payloadLen > 0
+    if (seg.retx) this._retransmits++
     this._injectSegment({
       protocol: 'TCP',
-      segment: flagsToLabel(seg.flags, hasData, false),
+      segment: flagsToLabel(seg.flags, hasData, seg.retx),
       sourceId: seg.srcNode,
       destinationId: seg.dstNode,
       srcPort: seg.srcPort,
@@ -550,85 +562,25 @@ export class SimulationEngine {
     return packet
   }
 
-  private _emit(flow: Flow, step: FlowStep, now: number, retx: boolean, seq?: number): Packet | null {
-    const dns = step.phase === 'dns'
-    const path = dns
-      ? (step.dir === 'fwd' ? flow.dnsPath! : flow.dnsRevPath!)
-      : (step.dir === 'fwd' ? flow.fwdPath : flow.revPath)
-    const baseLoss = dns ? flow.dnsLossProb : flow.lossProb
-    const lossAt = Math.random() < baseLoss ? 0.3 + Math.random() * 0.5 : null
+  private _emit(flow: Flow, step: FlowStep, now: number, retx: boolean): Packet | null {
+    const path = step.dir === 'fwd' ? flow.fwdPath : flow.revPath
+    const lossAt = Math.random() < flow.lossProb ? 0.3 + Math.random() * 0.5 : null
 
     const packet = this._injectSegment({
       flowId: flow.id,
-      protocol: dns ? 'UDP' : flow.protocol, // DNS rides UDP whatever the flow is
+      protocol: flow.protocol,
       segment: retx ? 'RETX' : step.segment,
       sourceId: path[0],
       destinationId: path[path.length - 1],
       srcPort: flow.srcPort,
-      dstPort: dns ? 53 : flow.dstPort,
+      dstPort: flow.dstPort,
       expectedHops: path.length - 1,
       simulationTimeMs: now,
-      lossProb: baseLoss,
+      lossProb: flow.lossProb,
       lossAt,
-      seq,
     })
     if (packet && step.wait) flow.awaitingPacketId = packet.id
     return packet
-  }
-
-  // One tick of TCP's congestion-controlled data phase for a flow: retransmit
-  // timed-out segments (halving the window — multiplicative decrease), then
-  // send new segments while the window has room.
-  private _tickTransfer(flow: Flow, now: number): void {
-    const tcp = flow.tcp!
-
-    // Loss detection: an unacked segment past the timeout whose packets (the
-    // DATA or its returning ACK) are no longer in flight was lost somewhere.
-    for (const [seq, seg] of tcp.inFlight) {
-      if (now - seg.sentAt <= TCP_TIMEOUT_MS) continue
-      const stillFlying = (this._aliveSeqs.get(flow.id)?.get(seq) ?? 0) > 0
-      if (stillFlying) continue
-
-      if (seg.retx >= MAX_RETX) {
-        flow.done = true // too many losses on one segment: connection reset
-        return
-      }
-
-      // Congestion response — once per loss burst, not per lost segment:
-      // ssthresh drops to half the window, and the window restarts there.
-      if (now - tcp.lastLossResponse > TCP_TIMEOUT_MS) {
-        tcp.ssthresh = Math.max(1, Math.floor(tcp.cwnd / 2))
-        tcp.cwnd = tcp.ssthresh
-        tcp.state = 'congestion-avoidance'
-        tcp.lossEvents++
-        tcp.lastLossResponse = now
-      }
-
-      this._retransmits++
-      seg.retx++
-      seg.sentAt = now
-      this._emit(flow, { segment: 'DATA', dir: 'fwd', wait: false }, now, true, seq)
-      break // at most one retransmission per tick
-    }
-    if (flow.done) return
-
-    // Slow start / congestion avoidance both cap outstanding data at cwnd.
-    // Normal senders stagger their sends so a window burst reads as a packet
-    // train; a DDoS flood doesn't pace itself — full-window bursts are exactly
-    // what overflows the victim's router queues.
-    const stagger = this._isDDoS ? 0 : TCP_DATA_STAGGER_MS
-    const window = Math.max(1, Math.floor(tcp.cwnd))
-    if (
-      tcp.nextSeq < tcp.totalSegments &&
-      tcp.inFlight.size < window &&
-      now - tcp.lastDataSent >= stagger
-    ) {
-      const seq = tcp.nextSeq
-      tcp.nextSeq++
-      tcp.lastDataSent = now
-      tcp.inFlight.set(seq, { sentAt: now, retx: 0 })
-      this._emit(flow, { segment: 'DATA', dir: 'fwd', wait: false }, now, false, seq)
-    }
   }
 
   private _processFlows(now: number): void {
@@ -639,39 +591,27 @@ export class SimulationEngine {
       if (flow.stepIndex >= flow.steps.length) {
         if (!this._hasInflight(flow.id)) {
           flow.done = true
-          this._completed++
+          if (!flow.internal) this._completed++ // DNS lookups aren't "connections"
         }
         continue
       }
 
       if (flow.awaiting) {
-        // Awaited packet lost? Retransmit (TCP reliability) until we give up.
-        if (now - flow.awaitingSince > TCP_TIMEOUT_MS && !this._hasInflight(flow.id) && flow.awaitingStep) {
+        // Awaited packet lost? Retransmit until we give up (ICMP/DNS reliability).
+        if (now - flow.awaitingSince > FLOW_RETX_TIMEOUT_MS && !this._hasInflight(flow.id) && flow.awaitingStep) {
           if (flow.retxCount < MAX_RETX) {
             flow.retxCount++
             this._retransmits++
             this._emit(flow, flow.awaitingStep, now, true)
             flow.awaitingSince = now
           } else {
-            flow.done = true // connection reset / abandoned
+            flow.done = true // exchange abandoned
           }
         }
         continue
       }
 
       const step = flow.steps[flow.stepIndex]
-
-      // TCP data phase: run the congestion window instead of emitting one
-      // packet, and only advance to teardown once every segment is acked.
-      if (step.phase === 'transfer') {
-        if (!flow.tcp) {
-          flow.stepIndex++
-          continue
-        }
-        this._tickTransfer(flow, now)
-        if (flow.tcp.ackedCount >= flow.tcp.totalSegments) flow.stepIndex++
-        continue
-      }
 
       if (!step.wait && now - flow.lastEmit < UDP_STAGGER_MS) continue
 
@@ -720,7 +660,7 @@ export class SimulationEngine {
           // Real per-endpoint TCP: hand the segment to the destination host's stack.
           this._endpoints.get(packet.destinationId)?.deliver(packet, tcpCtx)
         } else {
-          this._onDelivered(packet, realTimeMs)
+          this._onDelivered(packet)
         }
         this._lingerTimers.set(packet.id, realTimeMs + PACKET_LINGER_MS)
       } else if (result === 'dropped') {
@@ -731,33 +671,13 @@ export class SimulationEngine {
     }
   }
 
-  private _onDelivered(packet: Packet, now: number): void {
+  private _onDelivered(packet: Packet): void {
     const flow = this._flows.find(f => f.id === packet.flowId)
     if (!flow) return
 
-    // TCP data transfer (packets carrying a sequence number):
-    if (flow.tcp && packet.seq !== undefined) {
-      if (packet.destinationId === flow.dstId) {
-        // Receiver: every DATA (or retransmitted) segment that arrives is acked.
-        this._emit(flow, { segment: 'DATA-ACK', dir: 'ret', wait: false }, now, false, packet.seq)
-      } else if (packet.segment === 'DATA-ACK') {
-        // Sender: a new ACK opens the congestion window. Duplicate ACKs from
-        // spurious retransmissions are ignored (seq no longer outstanding).
-        const tcp = flow.tcp
-        if (tcp.inFlight.delete(packet.seq)) {
-          tcp.ackedCount++
-          if (tcp.state === 'slow-start') {
-            tcp.cwnd += 1 // +1 per ACK ⇒ the window doubles every RTT
-            if (tcp.cwnd >= tcp.ssthresh) tcp.state = 'congestion-avoidance'
-          } else {
-            tcp.cwnd += 1 / tcp.cwnd // additive increase: ~+1 per RTT
-          }
-        }
-      }
-    }
-
-    // Record RTT when the first reply of the exchange comes back.
-    if (!flow.rttRecorded && (packet.segment === 'SYN-ACK' || packet.segment === 'REPLY')) {
+    // Record RTT when an ICMP reply comes back (TCP RTT is sampled from the real
+    // stack's SRTT in _tickEndpoints).
+    if (!flow.rttRecorded && packet.segment === 'REPLY') {
       const rtt =
         computePathLatency(flow.fwdPath, this.graph.links) +
         computePathLatency(flow.revPath, this.graph.links)
@@ -767,11 +687,6 @@ export class SimulationEngine {
     }
 
     if (flow.awaiting && packet.id === flow.awaitingPacketId) {
-      // The resolver's answer made it back to the city → cache it there.
-      // (Checked via the awaited step so a retransmitted answer counts too.)
-      if (flow.awaitingStep?.segment === 'DNS-RESPONSE') {
-        this._dnsCache.set(`${flow.srcId}>${flow.dstId}`, now + DNS_TTL_MS)
-      }
       flow.awaiting = false
       flow.awaitingPacketId = null
       flow.awaitingStep = null
@@ -811,9 +726,12 @@ export class SimulationEngine {
         ? this._recentRtts.reduce((a, b) => a + b, 0) / this._recentRtts.length
         : 0
 
+    // Live "connections" = real TCP connections + connectionless UDP/ICMP
+    // exchanges (DNS lookups are infrastructure, not counted).
+    const flows = this._flows.filter(f => !f.done && !f.internal).length
     return {
       activePackets: active,
-      connections: this._flows.filter(f => !f.done).length,
+      connections: this._activeConnCount() + flows,
       completed: this._completed,
       droppedPackets: this._dropped,
       queuedPackets: queued,
@@ -880,6 +798,7 @@ export class SimulationEngine {
     this._aliveByFlow.clear()
     this._aliveSeqs.clear()
     this._endpoints = this._buildEndpoints()
+    this._homeIds = undefined
     this._isPaused = false
     this._routingMode = 'shortest-path'
     this._isDDoS = false
@@ -889,19 +808,34 @@ export class SimulationEngine {
     this.onStateChange?.(this._buildStats(), this.packets)
   }
 
-  // Live congestion-control snapshot for the packet inspector (null for
-  // non-TCP flows or flows that have been pruned).
+  // Disable the live traffic spawner (tests drive a single connection in
+  // isolation via appConnect).
+  setAutoTraffic(on: boolean): void {
+    this._autoTraffic = on
+  }
+
+  // Live congestion-control snapshot for the packet inspector — now sourced from
+  // the real per-endpoint TCP control block for the connection a segment belongs
+  // to. Its flowId is `tcp:${src}:${srcPort}>${dst}:${dstPort}`.
   getTcpInfo(flowId: string): TcpCongestionInfo | null {
-    const tcp = this._flows.find(f => f.id === flowId)?.tcp
-    if (!tcp) return null
+    const m = /^tcp:(.+):(\d+)>(.+):(\d+)$/.exec(flowId)
+    if (!m) return null
+    const [, a, aPort, b, bPort] = m
+    // The segment could be in either direction; find whichever end holds the
+    // sending TCB (the one with data to deliver).
+    const tcb =
+      this._endpoints.get(a)?.conns.get(`${aPort}:${b}:${bPort}`) ??
+      this._endpoints.get(b)?.conns.get(`${bPort}:${a}:${aPort}`)
+    if (!tcb) return null
+    const cwndSeg = Math.max(1, Math.round(tcb.cwnd / TCP_MSS))
     return {
-      cwnd: tcp.cwnd,
-      ssthresh: tcp.ssthresh,
-      state: tcp.state,
-      inFlightSegments: tcp.inFlight.size,
-      ackedSegments: tcp.ackedCount,
-      totalSegments: tcp.totalSegments,
-      lossEvents: tcp.lossEvents,
+      cwnd: cwndSeg,
+      ssthresh: Math.round(tcb.ssthresh / TCP_MSS),
+      state: tcb.cwnd < tcb.ssthresh ? 'slow-start' : 'congestion-avoidance',
+      inFlightSegments: Math.round(((tcb.sndNxt - tcb.sndUna) | 0) / TCP_MSS),
+      ackedSegments: Math.max(0, Math.round(((tcb.sndUna - tcb.iss - 1) | 0) / TCP_MSS)),
+      totalSegments: Math.max(1, Math.round(tcb.appToSend / TCP_MSS)),
+      lossEvents: tcb.lossEvents,
     }
   }
 

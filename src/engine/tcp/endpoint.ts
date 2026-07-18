@@ -287,6 +287,7 @@ export class TcpEndpoint {
       if (!tcb.inFastRecovery && tcb.dupAcks === 3) {
         // Fast retransmit + enter fast recovery (Reno/NewReno).
         tcb.ssthresh = Math.max(Math.floor(flightSize(tcb) / 2), 2 * MSS)
+        tcb.lossEvents++
         tcb.recover = tcb.sndMax
         this.resendOldest(tcb, ctx)
         tcb.cwnd = tcb.ssthresh + 3 * MSS
@@ -301,12 +302,12 @@ export class TcpEndpoint {
   // partial-ACK), without the Go-Back-N rewind an RTO does.
   private resendOldest(tcb: Tcb, ctx: TcpCtx): void {
     if (tcb.finSent && seqGeq(tcb.sndUna, tcb.finSeq)) {
-      this.send(tcb, ctx, F_FIN | F_ACK, tcb.finSeq, 0)
+      this.send(tcb, ctx, F_FIN | F_ACK, tcb.finSeq, 0, true)
     } else {
       const dataEnd = tcb.finRequested ? tcb.finSeq : tcb.writeSeq
       const len = Math.min(MSS, seqDiff(dataEnd, tcb.sndUna))
       if (len <= 0) return
-      this.send(tcb, ctx, F_PSH | F_ACK, tcb.sndUna, len)
+      this.send(tcb, ctx, F_PSH | F_ACK, tcb.sndUna, len, true)
     }
     const seg = tcb.inflight.get(tcb.sndUna)
     if (seg) {
@@ -395,6 +396,7 @@ export class TcpEndpoint {
     // Multiplicative decrease (a timeout is the strongest congestion signal).
     tcb.ssthresh = Math.max(Math.floor(flightSize(tcb) / 2), 2 * MSS)
     tcb.cwnd = MSS
+    tcb.lossEvents++
     tcb.inFastRecovery = false // a timeout supersedes fast recovery
     tcb.dupAcks = 0
     tcb.rttTiming = false // let a fresh (clean) RTT sample restart once recovered
@@ -405,7 +407,7 @@ export class TcpEndpoint {
       // The handshake SYN / SYN-ACK is still unacked — resend it directly
       // (sendSegments only originates the SYN, it doesn't retransmit it).
       const flags = tcb.state === 'SYN_RCVD' ? F_SYN | F_ACK : F_SYN
-      this.send(tcb, ctx, flags, tcb.iss, 0)
+      this.send(tcb, ctx, flags, tcb.iss, 0, true)
       const seg = tcb.inflight.get(tcb.iss)
       if (seg) {
         seg.sentAt = now
@@ -459,7 +461,7 @@ export class TcpEndpoint {
         if (len <= 0) break
         const end = seqAdd(tcb.sndNxt, len)
         const isNew = seqGeq(tcb.sndNxt, tcb.sndMax) // new territory vs a resend
-        this.send(tcb, ctx, F_PSH | F_ACK, tcb.sndNxt, len)
+        this.send(tcb, ctx, F_PSH | F_ACK, tcb.sndNxt, len, !isNew)
         this.track(tcb, tcb.sndNxt, end, ctx.now, isNew)
         tcb.sndNxt = end
         if (isNew) tcb.sndMax = end
@@ -472,7 +474,7 @@ export class TcpEndpoint {
       if (tcb.finRequested && !tcb.finSent && tcb.sndNxt === tcb.finSeq && can >= 1) {
         const finEnd = seqAdd(tcb.finSeq, 1)
         const isNew = seqGeq(tcb.finSeq, tcb.sndMax)
-        this.send(tcb, ctx, F_FIN | F_ACK, tcb.finSeq, 0)
+        this.send(tcb, ctx, F_FIN | F_ACK, tcb.finSeq, 0, !isNew)
         this.track(tcb, tcb.finSeq, finEnd, ctx.now, isNew)
         tcb.sndNxt = finEnd
         if (isNew) tcb.sndMax = finEnd
@@ -501,7 +503,7 @@ export class TcpEndpoint {
     if (seqGt(dataEnd, tcb.sndNxt)) {
       const end = seqAdd(tcb.sndNxt, 1)
       const isNew = seqGeq(tcb.sndNxt, tcb.sndMax)
-      this.send(tcb, ctx, F_PSH | F_ACK, tcb.sndNxt, 1)
+      this.send(tcb, ctx, F_PSH | F_ACK, tcb.sndNxt, 1, !isNew)
       this.track(tcb, tcb.sndNxt, end, ctx.now, isNew)
       tcb.sndNxt = end
       if (isNew) tcb.sndMax = end
@@ -513,7 +515,7 @@ export class TcpEndpoint {
 
   // ---- helpers ------------------------------------------------------------
 
-  private send(tcb: Tcb, ctx: TcpCtx, flags: number, seq: number, payloadLen: number): void {
+  private send(tcb: Tcb, ctx: TcpCtx, flags: number, seq: number, payloadLen: number, retx = false): void {
     ctx.inject({
       srcNode: tcb.localNode,
       dstNode: tcb.remoteNode,
@@ -524,6 +526,7 @@ export class TcpEndpoint {
       flags,
       window: this.recvWindow(tcb),
       payloadLen,
+      retx,
     })
     // Any segment we send carries our current ACK, so a pending delayed ACK is
     // satisfied (piggybacked).

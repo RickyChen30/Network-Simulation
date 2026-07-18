@@ -40,6 +40,7 @@ export interface OutSegment {
   flags: number // F_SYN | F_ACK | ...
   window: number // advertised receive window (bytes)
   payloadLen: number // application bytes carried (0 for pure control/ACK)
+  retx: boolean // a retransmission (for the RETX label + counter)
 }
 
 // The seam between an endpoint and the engine (kept as an interface so the TCB
@@ -127,6 +128,9 @@ export interface Tcb {
   bytesDelivered: number
   deliverHash: number
 
+  lossEvents: number // times the window was cut (timeout or fast retransmit)
+  rttSampled: boolean // this connection's SRTT has been fed to the latency readout
+
   done: boolean
 }
 
@@ -198,6 +202,9 @@ export function createTcb(a: CreateTcbArgs): Tcb {
 
     bytesDelivered: 0,
     deliverHash: STREAM_HASH_INIT,
+
+    lossEvents: 0,
+    rttSampled: false,
 
     done: false,
   }
