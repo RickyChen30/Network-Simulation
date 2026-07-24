@@ -172,19 +172,6 @@ protocol that runs the full stack.
 
 ---
 
-## Riding a packet
-
-Click any packet to follow it in a chase cam and open the **inspector**:
-protocol, size, TTL, application (HTTPS/DNS/…); live RTT, jitter, loss
-probability, bottleneck bandwidth; for TCP, the sender's live **congestion
-window / threshold / state**; the **AS path** it crossed; and a hop‑by‑hop route
-and timeline.
-
-<!-- screenshot: the packet inspector while riding a TCP packet -->
-![Riding a packet](screenshots/inspector.png)
-
----
-
 ## The C / WASM hybrid
 
 TCP is the one layer with a second life as C. The stack under `src/engine/tcp/`
