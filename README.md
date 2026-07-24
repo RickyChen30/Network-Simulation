@@ -98,7 +98,10 @@ Sydney reaches Singapore the long way via North America; repair it and the short
 path returns.
 
 <!-- screenshot: a cut cable (red arc) mid re-convergence, dashboard showing "Converging…" -->
-![A cut cable re-converging](screenshots/bgp-cut.png)
+
+https://github.com/user-attachments/assets/889c769b-3d56-4ca0-ae92-a2564ee4b60d
+
+
 
 ### 2 · Per‑hop forwarding
 
