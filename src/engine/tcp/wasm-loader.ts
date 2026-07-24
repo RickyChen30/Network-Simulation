@@ -1,13 +1,13 @@
 // wasm-loader.ts — load the C TCP core (native/tcp_core.c → tcp_core.wasm) and
 // present it behind the same seam the TS stack uses. This is the JS half of the
-// hybrid: the C core owns all TCP state; this adapter marshals GlobeNet's string
-// node-ids to the integer ids the core uses, and turns the core's host_emit
-// callback into an OutSegment the engine injects.
+// hybrid: the C core owns all TCP state; this adapter marshals the simulator's
+// string node-ids to the integer ids the core uses, and turns the core's
+// host_emit callback into an OutSegment the engine injects.
 //
 // STATUS: ready to activate once `native/tcp_core.wasm` is built (see
 // native/Makefile — needs a wasm-capable clang/emcc, which isn't installed in
 // this environment). Nothing imports this module yet, so the default TS stack is
-// unaffected. To switch GlobeNet onto the C core, see native/README.md.
+// unaffected. To switch the simulator onto the C core, see native/README.md.
 
 import type { OutSegment } from './tcb'
 import type { TcpCongestionInfo } from '../../types/network'

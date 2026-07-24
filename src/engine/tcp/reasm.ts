@@ -9,7 +9,7 @@ import { seqLt, seqLeq, seqGt } from './seq'
 // front of `rcvNxt` fills, `advance()` reports how far the contiguous, in-order
 // data now extends.
 //
-// Content is not stored — GlobeNet's payload is a pure function of stream offset
+// Content is not stored — the payload is a pure function of stream offset
 // (see the plan), so only which ranges arrived matters for correctness.
 
 interface Range {

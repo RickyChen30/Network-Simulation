@@ -1,355 +1,240 @@
-# 3D Global Internet Packet Simulator
+# 3D Internet Packet Simulator
 
-A real-time 3D simulation of how the internet actually moves data around the
-planet, rendered on an interactive globe. Real cities, internet exchange
-points, hyperscale data centers and submarine-cable landing stations sit at
-their true latitude/longitude, wired together by the terrestrial and subsea
-backbone. Packets are glowing comets that ride great-circle "cable" arcs —
-and underneath the visuals runs a real network stack: DNS resolution, per-hop
-IP forwarding, TCP with slow start and congestion avoidance, router queues
-with finite bandwidth, packet loss, and retransmission.
+An interactive 3D model of how the internet actually moves data around the
+planet. Real cities, internet exchanges, submarine‑cable landings and hyperscale
+data centres sit at their true latitude/longitude on a globe; packets ride
+great‑circle "cable" arcs between them. Underneath the visuals runs a real
+network stack — per‑hop IP forwarding, BGP between continents, finite‑bandwidth
+router queues, and a **byte‑accurate TCP** implementation (written in C, compiled
+to WebAssembly) — not a scripted animation.
 
-Built with TypeScript, React, Three.js, React Three Fiber, Drei, and
-TailwindCSS. The simulation engine is pure TypeScript with **zero rendering
-imports**, so everything described below can be verified headlessly
-(`npm run test:engine`).
+<!-- screenshot: the whole globe with live packet traffic -->
+![The globe with live traffic](screenshots/globe.png)
 
-**Explore:** drag to spin the globe, scroll to zoom. **Click a city** to fly
-down to a procedural night-time cityscape on the real coastline (with its own
-local network of homes, neighborhood routers and an uplink). **Click a packet**
-to ride along with it in a chase cam and open the deep packet inspector.
+Built with TypeScript, React, Three.js (React Three Fiber) and Tailwind, plus a
+C core for TCP. The simulation engine is framework‑free and headless‑testable.
 
-## Setup
+---
+
+## Run it
 
 ```bash
 npm install
-npm run dev
+npm run dev          # http://localhost:5173
 ```
 
-Then open [http://localhost:5173](http://localhost:5173).
+> The animation is driven by `requestAnimationFrame`, which browsers pause for
+> background tabs. Keep the tab focused to see traffic flow.
 
-> **Note:** the animation is driven by `requestAnimationFrame`, which browsers
-> pause for background tabs. Keep the tab focused to see traffic flow.
+Optional — build the C TCP core to WebAssembly so live TCP runs the C stack
+(needs a wasm‑capable clang; the app falls back to the TypeScript stack without
+it, see [The C / WASM hybrid](#the-c--wasm-hybrid)):
+
+```bash
+cd native && make wasm     # builds tcp_core.wasm and copies it into public/
+```
 
 ## Controls
 
-| Input  | Action                                                        |
-|--------|---------------------------------------------------------------|
-| SPACE  | Pause / resume the simulation                                 |
-| R      | Reset all flows, packets and counters                         |
-| A      | Toggle adaptive-routing mode flag (placeholder for now)       |
-| D      | DDoS — flood one victim server with unpaced TCP connections   |
-| F      | Toggle the data-center firewalls (routes reconverge live)     |
-| C      | Cut / repair a submarine cable — BGP withdraws & re-converges |
-| Esc    | Exit the packet ride / fly back out to the whole-globe view   |
-| Click  | A city → fly in · a packet → ride along + inspect it          |
-| Drag / Scroll | Spin the globe / zoom                                  |
+| Input | Action |
+|-------|--------|
+| Click a city | fly in to its cityscape + show its routing tables |
+| Click a packet | ride along with it and open the inspector |
+| `Space` | pause / resume · `R` reset |
+| `D` | DDoS — SYN‑flood one victim server |
+| `F` | toggle the data‑centre firewalls |
+| `C` | cut / repair a submarine cable (BGP re‑converges) |
+| `Esc` | leave the packet ride / fly back out |
+| Drag / Scroll | orbit / zoom |
 
 ---
 
 ## The network model
 
-Every node sits at its real latitude/longitude. Traffic originates in user
-cities, crosses continents over submarine cables, and terminates at servers
-inside data centers:
+Every node sits at its real location. Traffic originates in **user cities**,
+crosses continents over **submarine cables**, and terminates at **servers**
+inside data centres.
 
-```
-User city → backbone IXP → submarine-cable landing → ocean crossing →
-            IXP on another continent → data center → server
-```
+| Tier | Role |
+|------|------|
+| **User city** | a metro generating requests (London, Mumbai, São Paulo, …) |
+| **Backbone / IXP** | a city core router / internet exchange (LINX, DE‑CIX, …) |
+| **Cable landing** | a submarine‑cable landing or transit hub |
+| **Data centre** | a hyperscale facility (also acts as a firewall) |
+| **Server** | an application/CDN host inside a data centre |
 
-| Tier | Color | Real-world role |
-|------|-------|-----------------|
-| **User City** | amber | A metro generating requests (London, Mumbai, Sydney, …) |
-| **Backbone / IXP** | purple | City core router / internet exchange (LINX, AMS-IX, DE-CIX, …) |
-| **Cable Landing** | teal | Submarine-cable landing / transit hub (Marseille, Fujairah, LA, …) |
-| **Data Center** | rose | Hyperscale facility — also acts as a firewall |
-| **Server** | emerald | Application / CDN servers inside a data center |
-
-~68 world cities are auto-wired to their nearest backbone hub, every node gets
-an IP address, and links carry a one-way latency (ms) and a bandwidth rating
-that drives both loss rates and queueing (below).
+~68 cities are auto‑wired to their nearest backbone hub. Every node has an IP;
+every link has a one‑way latency (ms) and a bandwidth rating that together drive
+routing cost, loss, and queueing.
 
 ---
 
-## The infrastructure, layer by layer
+## How it works, layer by layer
 
-### 1. Flows, not lone packets
+The stack mirrors the real internet from the wire up.
 
-Every transmission is a **flow** — one logical conversation between a user
-city and a server. A flow picks a protocol (60% TCP, 30% UDP, 10% ICMP), an
-application port (TCP → 443/80, UDP → 53/443, ICMP → none), and an ephemeral
-source port (49152+). Each packet on screen belongs to a flow and carries a
-real segment type: `SYN`, `DATA-ACK`, `DNS-QUERY`, `RETX`, and so on. Packet
-sizes are realistic too — handshake/ACK control packets are 40–60 B, ICMP
-echoes 64 B, DNS answers 120–180 B, data segments 512–1500 B (MTU-ish).
+### 1 · Autonomous systems and BGP
 
-### 2. DNS resolution
+Each **continent is an autonomous system (AS)**. Routing runs at two levels:
 
-Before a city can open a connection it has to resolve the server's name.
-Each city's uplink hub doubles as its ISP's recursive resolver, so a lookup
-is a short `DNS-QUERY` / `DNS-RESPONSE` round-trip on the access link (UDP,
-port 53) that must complete before the flow's first SYN. Answers are cached
-per city with a 45-second TTL — repeat flows from the same city to the same
-server skip the lookup, which you can watch in the "DNS Lookups" counter
-(flows to port 53 are themselves DNS traffic and never trigger a lookup).
+- **Inside an AS (IGP):** shortest‑path (Dijkstra, latency‑weighted) fills each
+  router's forwarding table.
+- **Between ASes (BGP):** submarine cables are eBGP sessions. Each AS originates
+  its prefix and advertises routes carrying the full **AS_PATH**; receivers
+  reject paths containing themselves (loop prevention) and pick a best route
+  (shortest AS_PATH, lowest next‑hop AS as tie‑break). External traffic leaves
+  via the nearest egress toward the chosen next‑hop AS (**hot potato**).
 
-### 3. Per-hop forwarding tables (how routing actually works)
+The realism is in the *dynamics*: BGP updates are messages with per‑session
+propagation delay, so a change ripples outward AS by AS. Press **`C`** to cut a
+cable — the eBGP session drops, routes are **withdrawn**, distant ASes route on
+stale paths for seconds (packets black‑hole or briefly loop until their TTL
+expires), then everything settles on a longer detour. Cut Asia↔Oceania and
+Sydney reaches Singapore the long way via North America; repair it and the short
+path returns.
 
-Packets do **not** carry their route. Like real IP packets they know only
-their destination, and every router makes an independent decision:
+<!-- screenshot: a cut cable (red arc) mid re-convergence, dashboard showing "Converging…" -->
+![A cut cable re-converging](screenshots/bgp-cut.png)
 
-```
-packet arrives at node → look destination up in this node's forwarding table
-                       → hand it to the chosen neighbor → repeat
-```
+### 2 · Per‑hop forwarding
 
-The tables are built the way a converged link-state protocol (OSPF / IS-IS)
-would build them: one Dijkstra run per *destination* over the latency-weighted
-graph fills in that destination's column of every router's table
-(`routing.ts → buildForwardingTables`). Because links are symmetric, a node's
-predecessor in the shortest-path tree rooted at D is exactly its next hop
-toward D.
+Packets **don't carry their route**. Like real IP, each router looks the
+destination up in *its own* forwarding table and picks the next hop; a packet's
+path is discovered hop by hop, like a live traceroute. Tables are built the way
+a converged link‑state protocol (OSPF/IS‑IS) would build them — one Dijkstra per
+destination — and **re‑converge** whenever the topology changes (a cable cut, a
+firewall raised). Click any city to see its live forwarding table and its AS's
+BGP table.
 
-Consequences you can observe:
+<!-- screenshot: city view with the forwarding-table / BGP panel open -->
+![A city's routing tables](screenshots/forwarding-table.png)
 
-- A packet's route panel in the inspector fills in **hop by hop, like a live
-  traceroute** — the tail shows `⋯ → destination` until each router decides.
-- Toggling the firewall (`F`) makes the routers **reconverge**: routes through
-  the blocked data centers vanish from every table. Packets already in flight
-  get black-holed at the first router with no route — dropped mid-path, just
-  like real convergence events.
-- The TTL readout in the inspector decrements per actual router traversed.
+### 3 · Router queues and bandwidth
 
-### 4. Autonomous systems and BGP
+Links aren't infinitely fast. Every directed link is a router **output port**
+that transmits one packet at a time at a rate set by its bandwidth. A packet
+arriving at a busy port waits in an 8‑deep **FIFO queue**; when the queue is
+full, newcomers are **tail‑dropped**. This is where congestion becomes real —
+bursts overrun the queue, drops happen, and TCP backs off.
 
-Each **continent is an autonomous system** (a border city whose only uplink
-crosses continents joins its provider hub's AS, like a single-homed customer).
-Routing runs at two levels, the way the real internet does:
+### 4 · Packet loss
 
-- **Inside an AS (IGP):** plain latency-weighted Dijkstra over the continent's
-  own links fills the intra-AS part of every forwarding table.
-- **Between ASes (BGP):** the submarine cables are eBGP sessions. Every AS
-  originates its prefix and advertises routes carrying the full **AS_PATH**;
-  a receiver rejects any path containing its own AS (loop prevention), keeps
-  one candidate per neighbor, and runs the **decision process**: shortest
-  AS_PATH wins, lowest next-hop AS breaks ties. External traffic leaves via
-  the router's nearest egress toward the chosen next-hop AS (**hot potato**),
-  and the selected routes are installed into the same forwarding tables the
-  packets consult (RIB → FIB).
+Two independent sources:
 
-The dynamics are the realistic part. BGP updates are **messages with per-
-session propagation delay, paced by an MRAI timer** — nothing converges
-instantly (except the initial boot, which starts at steady state). Press `C`
-to cut a submarine cable:
+- **Random per‑link loss**, by link quality (backbone ~0.03%, last‑mile ~0.3%),
+  compounded along the path.
+- **Congestion loss** — the queue tail‑drops above, the dominant source under
+  load.
 
-- If it was the **last cable between two ASes, the eBGP session drops** and
-  both sides **withdraw** everything learned across it, then advertise their
-  new (longer or vanished) best paths to their remaining neighbors.
-- The change **ripples outward AS by AS over seconds** — the dashboard shows
-  "Converging…" while updates are in flight. Distant ASes keep routing on
-  stale paths meanwhile: packets get black-holed at routers with no route, or
-  briefly loop between ASes until their **TTL (32 hops)** expires — and
-  "path hunting" (an AS trying progressively longer stale routes before
-  settling) emerges by itself.
-- After convergence, traffic visibly reroutes — cut Europe–Africa and Lagos
-  traffic swings around via Asia; cut Asia–Oceania and Sydney reaches
-  Singapore the long way through North America. Press `C` again to repair the
-  cable: the session re-establishes, full tables are re-exchanged (with the
-  same delays), and the short paths return.
+### 5 · TCP — the real thing
 
-Click any city to see its AS's **BGP table** (best AS path per destination AS,
-live convergence state) above its forwarding table; ride a packet and the
-inspector shows the **AS Path** it actually crossed.
+Every TCP connection runs a genuine, spec‑faithful stack (implemented in C, see
+below), not a scripted handshake:
 
-### 5. TCP — handshake, sliding window, congestion control
+- **Three‑way handshake** → **windowed data** → **FIN teardown**.
+- **Congestion control:** slow start (window doubles per RTT), congestion
+  avoidance, **fast retransmit + NewReno** fast recovery on triple‑duplicate
+  ACKs, and multiplicative decrease on timeout.
+- **Reliability:** cumulative ACKs, out‑of‑order **reassembly**, Go‑Back‑N
+  timeout recovery, retransmission.
+- **RTT/RTO:** Jacobson/Karels estimation with Karn's algorithm.
+- **Flow control:** an advertised receive window; a stalled receiver closes the
+  window and the sender **persist‑probes** until it reopens.
 
-TCP flows run the full connection lifecycle:
+Payload is a deterministic function of stream offset, so the receiver verifies
+every byte it delivers — the transfer is provably **byte‑exact** even under loss
+and reordering.
 
-```
-SYN → SYN-ACK → ACK        (three-way handshake, stop-and-wait)
-DATA ⇄ DATA-ACK …          (windowed transfer, 10–16 sequenced segments)
-FIN → FIN-ACK              (teardown)
-```
+### 6 · DNS, UDP, ICMP
 
-The data phase is governed by a **congestion window** (`cwnd`), exactly as in
-classic TCP:
+Alongside TCP, the simulator runs **UDP** datagram bursts, **ICMP** echo/reply
+pings, and **DNS** lookups (a short UDP :53 round‑trip to the city's resolver
+before a connection). These stay on a lightweight flow model; TCP is the only
+protocol that runs the full stack.
 
-- **`cwnd` starts at 1 segment.** Every connection begins by probing the path
-  with a single packet.
-- **Slow start:** each ACK grows the window by 1 segment — which doubles it
-  every RTT (1 → 2 → 4 → 8). On the globe this reads as growing *trains* of
-  packets per round trip.
-- **Congestion avoidance:** once `cwnd` reaches the slow-start threshold
-  (`ssthresh`, initially 8), growth switches to additive increase —
-  `cwnd += 1/cwnd` per ACK, roughly +1 segment per RTT.
-- **Loss → multiplicative decrease:** an unacked segment that times out
-  (1.1 s with nothing left in flight) is treated as congestion:
-  `ssthresh = cwnd / 2`, `cwnd = ssthresh` — the window **halves** — and the
-  lost segment is **retransmitted** (visible as a `RETX` packet). One loss
-  burst halves the window once, not once per lost segment. After halving,
-  the sender simply stops sending until in-flight data drains below the
-  smaller window.
-- **Give-up:** five failed retransmissions of the same segment reset the
-  connection, like a real RST after repeated RTOs.
+### 7 · Attacks and faults
 
-Every DATA segment carries a sequence number; the receiver ACKs each arrival
-and duplicate ACKs (from spurious retransmits) are ignored. Ride along any
-TCP packet and the inspector shows the sender's live congestion state: the
-current **window**, **threshold**, **state** (slow start vs congestion
-avoidance), in-flight vs window, delivery progress, loss events, and a window
-bar with the `ssthresh` tick — you can watch it double, cross the threshold,
-and get halved.
-
-UDP, by contrast, just streams datagrams (no handshake, no ACKs, no recovery),
-and ICMP does echo/reply ping rounds — the classic reliability trade-off,
-side by side.
-
-### 6. Router queues and bandwidth limits
-
-Links aren't infinitely fast. Every directed link is a **router output port**
-that transmits one packet at a time; transmission takes
-`LINK_SERVICE_FACTOR / bandwidth` seconds, so a slim 120-unit city uplink
-serializes a packet every ~230 ms while an 800-unit data-center link does one
-every ~35 ms.
-
-A packet arriving while the port is busy parks in that port's **FIFO queue**
-(it visibly dims and waits at the router; the inspector reads "Queued at …").
-When the queue already holds 8 packets, newcomers are **tail-dropped** — the
-congestion signal TCP reacts to. Sending hosts contend for their own uplink
-like everyone else, so even the first hop can buffer or drop.
-
-This is where the transport and network layers meet: bursts from slow-start
-doubling pile into the bottleneck queue, the queue overflows, the drop times
-out at the sender, and the window halves. Congestion control emerges from the
-queues instead of being scripted.
-
-### 7. Packet loss
-
-Two independent loss mechanisms:
-
-- **Random transmission loss**, per link quality, compounded along the path:
-  backbone/subsea fiber ~0.03% per link, regional ~0.08%, last-mile ~0.3% —
-  a typical intercontinental path totals a fraction of a percent, which is
-  why you'll occasionally see a lone red flash and a retransmission even on a
-  calm network.
-- **Congestion loss** — the queue tail drops above. Deterministic, load-driven,
-  and the dominant source of drops under DDoS.
-
-### 8. DDoS — emergent congestion collapse
-
-Pressing `D` doesn't multiply a loss dial — it launches an actual flood:
-
-- All new flows converge on **one randomly chosen victim server**.
-- Flow spawn rate jumps 6×, with doubled connection and packet caps.
-- Attack senders **don't pace themselves** — they blast full congestion
-  windows instead of spacing sends out.
-
-The victim's ingress ports genuinely saturate: queues spike to capacity, tail
-drops cascade (watch "Queue Drops"), retransmissions climb, and every sender's
-window collapses — congestion collapse as an emergent property, not a
-hard-coded effect. Legitimate cross-traffic sharing those links suffers
-collateral queueing delay and loss.
-
-### 9. Firewalls
-
-`F` toggles the data centers off. The forwarding tables reconverge without
-them, so new flows fail instantly at the source ("no route") and in-flight
-packets die at the first router that can no longer forward them. TCP flows
-mid-transfer keep retransmitting into the void until they hit the retry cap
-and reset.
+- **`D` — DDoS:** a SYN flood converges on one victim server; its ingress queues
+  saturate, drops cascade, and every sender's window collapses — congestion
+  collapse as an emergent property.
+- **`F` — Firewall:** data centres go dark; routes re‑converge without them and
+  in‑flight packets die at the first router that can no longer forward them.
 
 ---
 
 ## Riding a packet
 
-Click any packet to follow it in a chase cam. The **inspector** panel shows:
+Click any packet to follow it in a chase cam and open the **inspector**:
+protocol, size, TTL, application (HTTPS/DNS/…); live RTT, jitter, loss
+probability, bottleneck bandwidth; for TCP, the sender's live **congestion
+window / threshold / state**; the **AS path** it crossed; and a hop‑by‑hop route
+and timeline.
 
-- **Identity** — protocol, segment, application (HTTPS/HTTP/DNS by port),
-  size in bytes, TTL (decrements per router), packet ID.
-- **Performance** — RTT, latency accrued to its current position, jitter,
-  the path's loss probability, and the bottleneck bandwidth seen so far.
-- **Congestion Control** (TCP) — live cwnd / ssthresh / state, in-flight vs
-  window, delivered segments, loss events, and the window bar.
-- **Connection** — current hop (or "Queued at …"), destination, hops taken
-  so far vs expected, and the route as discovered hop by hop.
-- **Timeline** — every node the packet has visited with cumulative one-way
-  latency, plus a pending entry for the destination until the route is known.
+<!-- screenshot: the packet inspector while riding a TCP packet -->
+![Riding a packet](screenshots/inspector.png)
+
+---
+
+## The C / WASM hybrid
+
+TCP is the one layer with a second life as C. The stack under `src/engine/tcp/`
+was written as a **pure core** — no sockets, no threads, an injected clock, all
+I/O behind a single callback — which made it portable almost verbatim to C
+(`native/tcp_core.c`). That C is **freestanding** (no libc, no `malloc`, fixed
+pools), so one source compiles two ways:
+
+- a **native** binary, verified by `native/tcp_test.c` (`make test`), and
+- a **WebAssembly** module the browser loads to run live TCP (`make wasm`).
+
+The seam is tiny: the C core *imports* one function (`host_emit`, to put a
+segment on the wire) and *exports* the `tcp_*` API. Because there's no `malloc`,
+no pointers cross the JS↔WASM boundary — every argument is a scalar. When the
+`.wasm` is present the globe runs the C stack; otherwise it transparently falls
+back to the identical TypeScript implementation. Details in
+[`native/README.md`](native/README.md).
 
 ---
 
 ## Architecture
 
-The engine/renderer split is the core design rule: `src/engine/` is pure
-TypeScript with no React or Three.js imports. Rendering reads engine state
-every frame and never mutates it.
+The core rule: `src/engine/` is pure TypeScript with no React/Three imports, so
+the whole simulation is unit‑testable without a browser. Rendering reads engine
+state each frame and never mutates it.
 
 ```
 src/
-  engine/                 # pure simulation logic (no rendering)
-    simulation.ts         # flows: DNS, TCP/UDP/ICMP state machines, cwnd,
-                          #   retransmits, DDoS, stats
-    network.ts            # node/link graph, AS membership, IGP+BGP → FIB, cable cuts
-    routing.ts            # Dijkstra + per-destination forwarding-table builder
-    bgp.ts                # eBGP between continent-ASes: AS_PATH selection,
-                          #   withdrawals, delayed update propagation (MRAI)
-    packet.ts             # per-hop packet lifecycle: forward, queue, drop, arc position
-    queues.ts             # router output ports: bandwidth service rate + FIFO queues
-  rendering/              # React Three Fiber scene
-    NetworkScene.tsx      # scene root, camera state machine, chase cam, ticks engine
-    Globe.tsx             # textured Earth, graticule, atmosphere
-    CityDetail.tsx        # land-masked procedural cityscape + local network
-    NodeMesh.tsx          # glowing city markers with label LOD
-    LinkMesh.tsx          # great-circle cable arcs with animated dashes
-    PacketMesh.tsx        # comet-trailed packets (dim while queued), clickable
-  ui/
-    Dashboard.tsx         # live telemetry incl. queued packets & queue drops
-    PacketInspector.tsx   # the deep packet panel described above
-    Legend.tsx, Controls.tsx
-  types/network.ts        # shared data model (Packet, stats, TcpCongestionInfo…)
-  config/
-    globe.ts              # lat/long → sphere + great-circle arc math
-    topology.ts           # ~30 backbone nodes + ~68 cities, IPs, links
-    constants.ts          # tuning: timing, queue capacity, service factor, camera
-  App.tsx                 # HUD state, keyboard, inspector wiring
+  engine/            pure simulation (no rendering)
+    simulation.ts      main loop: spawn, forward, step, stats
+    network.ts         node/link graph, AS membership, IGP+BGP → forwarding tables
+    routing.ts         Dijkstra + per-destination forwarding-table builder
+    bgp.ts             eBGP: AS_PATH selection, withdrawals, delayed convergence
+    packet.ts          per-hop packet lifecycle (forward / queue / drop)
+    queues.ts          router output ports: bandwidth + FIFO queues
+    tcp/               the TCP stack (TS) — mirrored by the C core
+  rendering/         React Three Fiber scene (globe, arcs, instanced packets, cameras)
+  ui/                HUD: dashboard, packet inspector, routing panels, legend
+  config/            globe math, topology (nodes/cities/links), tuning constants
+native/              the C TCP core + native test + WASM build
 scripts/
-  engine-test.mts         # headless engine verification
-public/
-  earth-*.jpg/png         # NASA blue-marble day/night/topology textures (offline)
+  engine-test.mts    headless verification of the whole engine
 ```
 
-## Verifying the engine
+Packets render in **three instanced draw calls** regardless of count, and engine
+state is pushed to React at ~8 Hz — so thousands of simultaneous packets stay
+smooth.
+
+---
+
+## Verification
 
 ```bash
-npm run test:engine
+npm run test:engine        # headless engine checks (routing, BGP, queues, TCP, …)
+cd native && make test     # the C TCP core, natively
 ```
 
-Drives ~55 seconds of simulated traffic through three phases — normal
-operation, a DDoS flood, and a firewall raise — and asserts, among others:
-
-- flows complete and RTTs are measured; DNS resolves before connections open
-- forwarding tables agree with Dijkstra; packets never know more than their
-  next hop; delivered packets end exactly at their destination
-- every TCP connection starts at `cwnd = 1`, slow start grows the window,
-  congestion avoidance is reached, ACKs echo DATA sequence numbers, and
-  transfers complete
-- loss events halve the window (`ssthresh = cwnd/2`) and land in
-  congestion avoidance
-- packets queue at busy ports, resume FIFO, and the flood produces real
-  tail drops
-- the firewall blocks traffic; reset clears all state
-
-## Extending
-
-| Idea | Where to start |
-|------|----------------|
-| Fast retransmit / dup-ACK detection | `simulation.ts` `_onDelivered()` — count duplicate ACKs, skip the RTO |
-| Adaptive routing under load | `routing.ts` — weight edges by live queue depth, rebuild tables periodically |
-| Active queue management (RED/CoDel) | `queues.ts` — probabilistic early drops as queues grow |
-| Per-link load coloring | `LinkMesh.tsx` — tint arcs by port utilization |
-| New cities / nodes | `topology.ts` — add to `WORLD_CITIES` (lat/long, auto-wired) or `NODE_DEFS` for infrastructure |
-| Day/night terminator | `Globe.tsx` — shader masking night lights by sun angle |
-
-The Earth textures are NASA imagery (via the
-[three-globe](https://github.com/vasturiano/three-globe) example assets)
-served locally from `public/`, so the app works offline.
+`engine-test.mts` drives the simulation through normal traffic, a DDoS flood, a
+cable cut/repair and a firewall raise, asserting ~18 invariants: forwarding
+matches Dijkstra, BGP withdraws and re‑converges, queues fill and overflow, TCP
+transfers arrive byte‑exact (including under 4% forced loss and with fast
+retransmit / flow control), and — when the wasm is built — that the live globe's
+TCP connections complete through the **C core**.
