@@ -10,6 +10,10 @@ router queues, and a **byte‑accurate TCP** implementation.
 <!-- screenshot: the whole globe with live packet traffic -->
 
 
+https://github.com/user-attachments/assets/d7fc5500-dd5f-41e6-b3b3-e2913c3c721e
+
+
+
 
 Built with TypeScript, React, Three.js (React Three Fiber) and Tailwind, plus a
 C core for TCP. The simulation engine is framework‑free and headless‑testable.
