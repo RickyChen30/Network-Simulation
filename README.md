@@ -1,15 +1,15 @@
 # 3D Internet Packet Simulator
 
 An interactive 3D model of how the internet actually moves data around the
-planet. Real cities, internet exchanges, submarine‑cable landings and hyperscale
+Earth. Real cities, internet exchanges, submarine‑cable landings and hyperscale
 data centres sit at their true latitude/longitude on a globe; packets ride
 great‑circle "cable" arcs between them. Underneath the visuals runs a real
 network stack — per‑hop IP forwarding, BGP between continents, finite‑bandwidth
-router queues, and a **byte‑accurate TCP** implementation (written in C, compiled
-to WebAssembly) — not a scripted animation.
+router queues, and a **byte‑accurate TCP** implementation.
 
 <!-- screenshot: the whole globe with live packet traffic -->
-![The globe with live traffic](screenshots/globe.png)
+
+
 
 Built with TypeScript, React, Three.js (React Three Fiber) and Tailwind, plus a
 C core for TCP. The simulation engine is framework‑free and headless‑testable.
