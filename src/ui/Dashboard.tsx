@@ -1,4 +1,5 @@
 import type { SimulationStats } from '../types/network'
+import { PROTOCOL_COLORS } from '../config/topology'
 
 interface DashboardProps {
   stats: SimulationStats
@@ -38,20 +39,22 @@ export function Dashboard({ stats }: DashboardProps) {
         </span>
       </div>
 
+      {/* Values stay neutral; colour is reserved for what it means — teal for the
+          live connection count, green for good, red for loss, amber for warnings. */}
       <div>
-        <StatRow label="Connections" value={stats.connections} color="text-cyan-300" />
-        <StatRow label="In Flight" value={stats.activePackets} color="text-sky-300" />
+        <StatRow label="Connections" value={stats.connections} color="text-teal-300" />
+        <StatRow label="In Flight" value={stats.activePackets} color="text-slate-100" />
         <StatRow label="Completed" value={stats.completed} color="text-emerald-400" />
-        <StatRow label="Queued" value={stats.queuedPackets} color="text-yellow-300" />
-        <StatRow label="Dropped" value={stats.droppedPackets} color="text-rose-400" />
-        <StatRow label="Queue Drops" value={stats.queueDrops} color="text-rose-300" />
-        <StatRow label="Retransmits" value={stats.retransmits} color="text-orange-300" />
-        <StatRow label="DNS Lookups" value={stats.dnsLookups} color="text-violet-300" />
-        <StatRow label="Avg RTT" value={`${stats.averageLatency} ms`} color="text-amber-300" />
+        <StatRow label="Queued" value={stats.queuedPackets} color="text-slate-100" />
+        <StatRow label="Dropped" value={stats.droppedPackets} color={stats.droppedPackets ? 'text-rose-400' : 'text-slate-100'} />
+        <StatRow label="Queue Drops" value={stats.queueDrops} color={stats.queueDrops ? 'text-rose-300' : 'text-slate-100'} />
+        <StatRow label="Retransmits" value={stats.retransmits} color={stats.retransmits ? 'text-amber-300' : 'text-slate-100'} />
+        <StatRow label="DNS Lookups" value={stats.dnsLookups} color="text-slate-100" />
+        <StatRow label="Avg RTT" value={`${stats.averageLatency} ms`} color="text-slate-100" />
         <StatRow
           label="Routing"
           value={modeLabel[stats.routingMode] ?? stats.routingMode}
-          color="text-purple-300"
+          color="text-slate-300"
         />
         <StatRow
           label="BGP"
@@ -65,9 +68,9 @@ export function Dashboard({ stats }: DashboardProps) {
       <div className="mt-3 pt-3 border-t border-white/5">
         <p className="text-[10px] text-slate-500 uppercase tracking-[0.2em] mb-2">Protocols in flight</p>
         <div className="flex gap-1.5">
-          <ProtoChip label="TCP" value={stats.protocolMix.TCP} color="#38bdf8" />
-          <ProtoChip label="UDP" value={stats.protocolMix.UDP} color="#c084fc" />
-          <ProtoChip label="ICMP" value={stats.protocolMix.ICMP} color="#34d399" />
+          <ProtoChip label="TCP" value={stats.protocolMix.TCP} color={PROTOCOL_COLORS.TCP} />
+          <ProtoChip label="UDP" value={stats.protocolMix.UDP} color={PROTOCOL_COLORS.UDP} />
+          <ProtoChip label="ICMP" value={stats.protocolMix.ICMP} color={PROTOCOL_COLORS.ICMP} />
         </div>
       </div>
     </div>

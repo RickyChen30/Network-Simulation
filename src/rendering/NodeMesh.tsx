@@ -104,9 +104,6 @@ export const NodeMesh = memo(function NodeMesh({ node, active, showLabel, onFocu
             className="px-1.5 py-0.5 rounded text-center whitespace-nowrap text-slate-100 bg-slate-950/65 border border-white/10 hover:border-teal-300/60 transition-colors"
           >
             <div className="text-[11px] font-medium tracking-wide leading-tight">{node.label}</div>
-            {node.subLabel && (
-              <div className="text-[9px] text-slate-400 leading-tight">{node.subLabel}</div>
-            )}
           </div>
         </Html>
       )}

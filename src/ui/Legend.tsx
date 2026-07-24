@@ -1,5 +1,5 @@
 import type { NodeType } from '../types/network'
-import { NODE_COLORS, NODE_TIER_LABELS } from '../config/topology'
+import { NODE_COLORS, NODE_TIER_LABELS, PROTOCOL_COLORS } from '../config/topology'
 
 // Explains the network hierarchy so viewers can read the topology.
 // Only the tiers actually used in the global topology are listed.
@@ -18,7 +18,7 @@ export function Legend() {
           <div key={type} className="flex items-center gap-2.5">
             <span
               className="w-3 h-3 rounded-sm shrink-0"
-              style={{ backgroundColor: NODE_COLORS[type], boxShadow: `0 0 8px ${NODE_COLORS[type]}` }}
+              style={{ backgroundColor: NODE_COLORS[type] }}
             />
             <span className="text-xs text-slate-300">{NODE_TIER_LABELS[type]}</span>
           </div>
@@ -28,15 +28,15 @@ export function Legend() {
       <div className="mt-3 pt-3 border-t border-white/5 space-y-1.5">
         <p className="text-[10px] text-slate-500 uppercase tracking-[0.2em] mb-1">Protocols</p>
         <div className="flex items-center gap-2.5">
-          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: '#38bdf8', boxShadow: '0 0 8px #38bdf8' }} />
+          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: PROTOCOL_COLORS.TCP }} />
           <span className="text-xs text-slate-300">TCP (handshake + ACKs)</span>
         </div>
         <div className="flex items-center gap-2.5">
-          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: '#c084fc', boxShadow: '0 0 8px #c084fc' }} />
+          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: PROTOCOL_COLORS.UDP }} />
           <span className="text-xs text-slate-300">UDP (datagrams)</span>
         </div>
         <div className="flex items-center gap-2.5">
-          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: '#34d399', boxShadow: '0 0 8px #34d399' }} />
+          <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: PROTOCOL_COLORS.ICMP }} />
           <span className="text-xs text-slate-300">ICMP (ping)</span>
         </div>
       </div>

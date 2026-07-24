@@ -293,15 +293,17 @@ const CITY_LINKS: NetworkLink[] = INITIAL_NODES.filter(n => n.id.startsWith('cit
 
 export const INITIAL_LINKS: NetworkLink[] = [...BACKBONE_LINKS, ...CITY_LINKS]
 
-// Node type → primary color, shared by rendering and the UI legend.
+// Node type → primary color. A restrained, cartographic palette: warm cities,
+// neutral-steel backbone, teal cable landings, terracotta data centres. Shared
+// by the globe markers and the UI legend.
 export const NODE_COLORS: Record<NodeType, string> = {
-  home: '#fbbf24',          // amber
-  'home-router': '#22d3ee', // cyan (unused at global scale)
-  'isp-router': '#38bdf8',  // sky (unused at global scale)
-  'core-router': '#a855f7', // purple — backbone / IXP
-  datacenter: '#fb7185',    // rose — data center / firewall
-  server: '#34d399',        // emerald
-  gateway: '#2dd4bf',       // teal — submarine cable landing
+  home: '#e6b34a',          // gold — user cities (the sources of traffic)
+  'home-router': '#7fb7c9', // muted cyan (unused at global scale)
+  'isp-router': '#6e93b8',  // steel (unused at global scale)
+  'core-router': '#8493a8', // steel slate — backbone / IXP (neutral infrastructure)
+  datacenter: '#dd6a4d',    // terracotta — data center / firewall
+  server: '#57bd7d',        // green
+  gateway: '#33b3a4',       // teal — submarine cable landing
 }
 
 // Human-friendly tier names for the legend.
@@ -315,9 +317,9 @@ export const NODE_TIER_LABELS: Record<NodeType, string> = {
   gateway: 'Cable Landing',
 }
 
-// Packet colors by transport protocol.
+// Packet colors by transport protocol — the moving data, kept vivid and distinct.
 export const PROTOCOL_COLORS: Record<'TCP' | 'UDP' | 'ICMP', string> = {
-  TCP: '#38bdf8',  // blue — reliable, connection-oriented
-  UDP: '#c084fc',  // purple — connectionless datagrams
-  ICMP: '#34d399', // green — echo / ping
+  TCP: '#4da3ff',  // azure — reliable, connection-oriented
+  UDP: '#f2894a',  // orange — connectionless datagrams
+  ICMP: '#4fce8d', // green — echo / ping
 }
