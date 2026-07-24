@@ -114,7 +114,10 @@ firewall raised). Click any city to see its live forwarding table and its AS's
 BGP table.
 
 <!-- screenshot: city view with the forwarding-table / BGP panel open -->
-![A city's routing tables](screenshots/forwarding-table.png)
+
+https://github.com/user-attachments/assets/24d5227f-5350-4214-8fd2-b47a53a829f7
+
+
 
 ### 3 · Router queues and bandwidth
 
