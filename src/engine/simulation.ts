@@ -11,6 +11,7 @@ import { computePathLatency } from './routing'
 import { createPacket, resetPacketCounter, stepPacket, type ForwardingContext } from './packet'
 import { LinkScheduler } from './queues'
 import { TcpEndpoint } from './tcp/endpoint'
+import type { WasmTcpStack } from './tcp/wasm-loader'
 import { flagsToLabel, type TcpCtx, type OutSegment, type Tcb } from './tcp/tcb'
 import { PORT_HTTP, PORT_HTTPS, MSS as TCP_MSS } from './tcp/tcp-const'
 import { MAX_ACTIVE_PACKETS, PACKET_LINGER_MS, LATENCY_WINDOW } from '../config/constants'
@@ -139,6 +140,10 @@ export class SimulationEngine {
   private _scheduler: LinkScheduler
   // Per-host TCP endpoints (home + server nodes).
   private _endpoints: Map<string, TcpEndpoint>
+  // When set, live TCP runs on the C core compiled to WASM instead of the TS
+  // endpoints (the hybrid). Enabled by the browser once tcp_core.wasm loads;
+  // tests keep the TS stack. See src/engine/tcp/wasm-loader.ts.
+  private _wasmTcp: WasmTcpStack | null = null
   private _homeIds?: Set<string>
   private _tcpTestLoss: number | null = null
   private _autoTraffic = true // live spawner (tests disable it for isolation)
@@ -210,6 +215,27 @@ export class SimulationEngine {
   /** The TCP endpoint hosted on a node, if it is a host (home/server). */
   getTcpEndpoint(nodeId: string): TcpEndpoint | undefined {
     return this._endpoints.get(nodeId)
+  }
+
+  // Switch live TCP over to the C core (WASM). The servers are re-registered as
+  // listeners in the C stack; from here on the spawner opens real C connections,
+  // and delivery / ticking / stats read from the C stack instead of the TS one.
+  useWasmTcp(stack: WasmTcpStack): void {
+    for (const id of this.graph.getServerIds()) {
+      stack.listen(id, PORT_HTTP)
+      stack.listen(id, PORT_HTTPS)
+    }
+    this._wasmTcp = stack
+  }
+
+  get tcpBackend(): 'ts' | 'wasm-c' {
+    return this._wasmTcp ? 'wasm-c' : 'ts'
+  }
+
+  // The seam the WASM stack's host_emit calls to put a C-decided segment on the
+  // simulated wire (fires during tick/deliver, when _nowMs is current).
+  injectTcpSegment(seg: OutSegment): void {
+    this._injectTcpSegment(seg, this._nowMs)
   }
 
   private _aliveInc(p: Packet): void {
@@ -287,8 +313,9 @@ export class SimulationEngine {
     return this._isDDoS ? MAX_ACTIVE_PACKETS * 2 : MAX_ACTIVE_PACKETS
   }
 
-  // Total live TCP connections across all host endpoints.
+  // Total live TCP connections.
   private _activeConnCount(): number {
+    if (this._wasmTcp) return this._wasmTcp.activeConns()
     let n = 0
     for (const ep of this._endpoints.values()) {
       for (const tcb of ep.conns.values()) if (!tcb.done) n++
@@ -323,8 +350,6 @@ export class SimulationEngine {
   // connection itself is opened right away.
   private _startTcpApp(srcId: string, dstId: string, now: number): void {
     if (this._activeConnCount() >= (this._isDDoS ? MAX_TCP_CONNS * 3 : MAX_TCP_CONNS)) return
-    const ep = this._endpoints.get(srcId)
-    if (!ep) return
 
     if (!this._isDDoS) {
       const cached = (this._dnsCache.get(`${srcId}>${dstId}`) ?? 0) > now
@@ -335,7 +360,12 @@ export class SimulationEngine {
     }
     const port = Math.random() < 0.5 ? PORT_HTTPS : PORT_HTTP
     const bytes = TCP_XFER_MIN + Math.floor(Math.random() * TCP_XFER_SPAN)
-    ep.connect(dstId, port, bytes)
+
+    if (this._wasmTcp) {
+      this._wasmTcp.connect(srcId, dstId, port, bytes) // C core (WASM)
+      return
+    }
+    this._endpoints.get(srcId)?.connect(dstId, port, bytes)
   }
 
   // A DNS lookup: a short UDP :53 round-trip up the city's access link to its
@@ -439,6 +469,12 @@ export class SimulationEngine {
 
   // Run every endpoint's timers + sender for this tick.
   private _tickEndpoints(now: number): void {
+    if (this._wasmTcp) {
+      // Live TCP runs on the C core: tick it, then reap finished connections.
+      this._wasmTcp.tick(now)
+      this._completed += this._wasmTcp.reap()
+      return
+    }
     const ctx = this._tcpCtx(now)
     const homes = this._homeIds ?? (this._homeIds = new Set(this.graph.getHomeIds()))
     for (const [nodeId, ep] of this._endpoints) {
@@ -657,8 +693,15 @@ export class SimulationEngine {
       if (result === 'delivered') {
         this._aliveDec(packet)
         if (packet.tcpFlags !== undefined) {
-          // Real per-endpoint TCP: hand the segment to the destination host's stack.
-          this._endpoints.get(packet.destinationId)?.deliver(packet, tcpCtx)
+          // Real TCP segment → hand it to the destination host's stack (the C
+          // core when WASM is enabled, else the TS endpoints).
+          if (this._wasmTcp) {
+            this._wasmTcp.deliver(realTimeMs, packet.destinationId, packet.sourceId,
+              packet.srcPort, packet.dstPort, packet.seq ?? 0, packet.ackNo ?? 0,
+              packet.tcpFlags, packet.window ?? 0, packet.payloadLen ?? 0)
+          } else {
+            this._endpoints.get(packet.destinationId)?.deliver(packet, tcpCtx)
+          }
         } else {
           this._onDelivered(packet)
         }
@@ -744,6 +787,7 @@ export class SimulationEngine {
       isPaused: this._isPaused,
       bgpConverging: this.graph.isBgpConverging(),
       cutCable: this.graph.getCutCableLabel(),
+      tcpBackend: this._wasmTcp ? 'wasm-c' : 'ts',
     }
   }
 
@@ -818,6 +862,7 @@ export class SimulationEngine {
   // the real per-endpoint TCP control block for the connection a segment belongs
   // to. Its flowId is `tcp:${src}:${srcPort}>${dst}:${dstPort}`.
   getTcpInfo(flowId: string): TcpCongestionInfo | null {
+    if (this._wasmTcp) return this._wasmTcp.getInfo(flowId)
     const m = /^tcp:(.+):(\d+)>(.+):(\d+)$/.exec(flowId)
     if (!m) return null
     const [, a, aPort, b, bPort] = m

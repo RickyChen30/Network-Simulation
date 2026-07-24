@@ -25,11 +25,17 @@ const DEFAULT_STATS: SimulationStats = {
   isPaused: false,
   bgpConverging: false,
   cutCable: null,
+  tcpBackend: 'ts',
 }
 
 export default function App() {
   // Engine lives outside React state — a stable singleton for this mount.
-  const engine = useMemo(() => new SimulationEngine(), [])
+  // Hold traffic until we know which TCP backend to run (see the effect below).
+  const engine = useMemo(() => {
+    const e = new SimulationEngine()
+    e.setAutoTraffic(false)
+    return e
+  }, [])
 
   const [stats, setStats] = useState<SimulationStats>(DEFAULT_STATS)
   // Live packet list (updated each frame) — used to drive the packet inspector.
@@ -67,6 +73,28 @@ export default function App() {
     setStats(newStats)
     setPackets(newPackets)
   }, [])
+
+  // Run live TCP on the C core (compiled to WASM) once it loads; fall back to
+  // the TypeScript stack if the module can't be fetched. Traffic starts only
+  // after this resolves, so every connection runs on the chosen backend.
+  useEffect(() => {
+    let cancelled = false
+    import('./engine/tcp/wasm-loader')
+      .then(({ WasmTcpStack }) =>
+        WasmTcpStack.load('/tcp_core.wasm', seg => engine.injectTcpSegment(seg)),
+      )
+      .then(stack => {
+        if (cancelled) return
+        engine.useWasmTcp(stack)
+        engine.setAutoTraffic(true)
+      })
+      .catch(() => {
+        if (!cancelled) engine.setAutoTraffic(true) // TS stack fallback
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [engine])
 
   const handleSelectPacket = useCallback((p: Packet | null) => {
     setSelectedFlowId(p ? p.flowId : null)

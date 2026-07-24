@@ -167,4 +167,7 @@ export interface SimulationStats {
   // human label of the currently cut submarine cable (null = none cut).
   bgpConverging: boolean
   cutCable: string | null
+  // Which TCP implementation is handling live connections: the TypeScript stack,
+  // or the C core compiled to WASM (the hybrid).
+  tcpBackend: 'ts' | 'wasm-c'
 }

@@ -5,6 +5,8 @@ import type { SimulationStats } from '../src/types/network'
 import { seqLt, seqGt, seqAdd, seqDiff } from '../src/engine/tcp/seq'
 import { Reasm } from '../src/engine/tcp/reasm'
 import { STREAM_HASH_INIT, foldStreamHash } from '../src/engine/tcp/tcb'
+import { WasmTcpStack } from '../src/engine/tcp/wasm-loader'
+import { readFileSync } from 'node:fs'
 
 // --- TCP scaffold unit checks (Milestone 1) ---------------------------------
 // The trickiest primitives of the per-endpoint stack are pure and testable now.
@@ -368,6 +370,32 @@ const okFlowControl =
 console.log('\n--- Milestone 3b: flow control + persist ---')
 console.log('flow ctrl   :', `zero-window ${sawZeroWin}, persist ${sawPersist}, delivered ${fcServer?.bytesDelivered ?? 0}/${FC_XFER}, client ${fcClient?.state ?? '-'}`)
 
+// --- Hybrid: the live globe running the C TCP stack (compiled to WASM) -------
+// Load native/tcp_core.wasm, switch the engine's live TCP onto it, run the
+// spawner, and confirm real C connections complete over the simulated network.
+let okWasm = false
+let wasmBackend = '(not loaded)'
+let wasmCompleted = 0
+try {
+  const wasmBytes = readFileSync(new URL('../native/tcp_core.wasm', import.meta.url))
+  const tw = new SimulationEngine()
+  let lastW: SimulationStats | null = null
+  tw.onStateChange = s => { lastW = s }
+  const stack = await WasmTcpStack.fromBytes(wasmBytes, seg => tw.injectTcpSegment(seg))
+  tw.useWasmTcp(stack)
+  const dtw = 1 / 60
+  let mw = 0
+  for (let i = 0; i < Math.round(50 / dtw); i++) { mw += dtw * 1000; tw.tick(dtw, mw) }
+  wasmBackend = tw.tcpBackend
+  wasmCompleted = lastW ? lastW.completed : 0
+  okWasm = tw.tcpBackend === 'wasm-c' && wasmCompleted > 0
+} catch (e) {
+  console.log('  [wasm] skipped:', (e as Error).message)
+}
+console.log('\n--- Hybrid: live TCP on the C core (WASM) ---')
+console.log('backend     :', wasmBackend)
+console.log('completed   :', wasmCompleted, 'C connections')
+
 console.log('\n--- Results ---')
 console.log('flows complete    :', okNormal ? 'PASS' : 'FAIL')
 console.log('tcp handshake seen:', sawHandshake || protocolsSeen >= 0 ? 'PASS' : 'FAIL')
@@ -384,12 +412,13 @@ console.log('tcp byte-exact    :', okByteExact ? 'PASS' : 'FAIL')
 console.log('tcp teardown      :', okTeardown ? 'PASS' : 'FAIL')
 console.log('tcp fast retransmit:', okFastRetx ? 'PASS' : 'FAIL')
 console.log('tcp flow control  :', okFlowControl ? 'PASS' : 'FAIL')
+console.log('wasm c core (live):', okWasm ? 'PASS' : 'FAIL')
 
 if (
   !seqOk || !reasmOk ||
   !okNormal || !okDns || !okForwarding || !okQueues ||
   !okBgpRouting || !okWithdrawal || !okDelay || !okRepair || !okFirewall || !okReset || !okM2 ||
-  !okFastRetx || !okFlowControl
+  !okFastRetx || !okFlowControl || !okWasm
 )
   process.exit(1)
 console.log('\nALL CHECKS PASSED')
