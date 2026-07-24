@@ -23,3 +23,8 @@ pnpm-debug.log*
 # Vite / TS caches
 .vite/
 *.tsbuildinfo
+
+# C core build artifacts — keep the source (native/*.c/*.h/Makefile), never the
+# compiled binaries. Rebuild with `make wasm` (browser) / `make test` (native).
+*.wasm
+native/tcp_test
